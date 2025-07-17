@@ -1176,10 +1176,6 @@ Generate the CV as a complete HTML document with:
     if user_query:
         prompt += f"\n\nAdditional user instructions: {user_query}\n"
 
-    # After formatting the prompt for the LLM in /optimize-cv, save it to a file for inspection
-    with open('last_used_cv_prompt.txt', 'w', encoding='utf-8') as f:
-        f.write(prompt)
-
     try:
         headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
