@@ -1,5 +1,7 @@
 # CV Maker API - AI-Powered Resume and Cover Letter Generator
 
+[![Olaverse API](https://img.shields.io/badge/Olaverse-API%20Doc-blue?style=flat-square)](https://www.olaverse.co.uk/cv-maker-api)
+
 A FastAPI-based service that uses AI to generate professional resumes and cover letters with three distinct design styles.
 
 ## Features
