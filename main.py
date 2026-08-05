@@ -4,10 +4,10 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 import requests
-from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL, AVAILABLE_MODELS, resolve_model, GOTENBERG_URL, GOTENBERG_USERNAME, GOTENBERG_PASSWORD, CORS_ALLOW_ORIGINS
+from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL, AVAILABLE_MODELS, resolve_model, GOTENBERG_URL, GOTENBERG_USERNAME, GOTENBERG_PASSWORD, CORS_ALLOW_ORIGINS, ANALYSIS_MAX_TOKENS
 import tempfile
 import os
-from utils import convert_html_to_pdf, extract_document_text, DocumentError
+from utils import convert_html_to_pdf, extract_document_text, DocumentError, parse_model_json
 from templates import get_style_template
 from openrouter import chat_completion, OpenRouterError
 import json as pyjson
@@ -87,18 +87,21 @@ Return ONLY the JSON object, no explanations or additional text.
 """
     try:
         analysis_content = chat_completion(
-            selected_model, analysis_prompt, temperature=0.3, max_tokens=2000)
+            selected_model, analysis_prompt, temperature=0.3,
+            max_tokens=ANALYSIS_MAX_TOKENS)
     except OpenRouterError as e:
         return JSONResponse({'error': f'API request failed: {e}'}, status_code=500)
-    try:
-        analysis_json = pyjson.loads(analysis_content)
-    except Exception:
-        if analysis_content.startswith('```json'):
-            analysis_content = analysis_content[7:]
-        if analysis_content.endswith('```'):
-            analysis_content = analysis_content[:-3]
-        analysis_content = analysis_content.strip()
-        analysis_json = pyjson.loads(analysis_content)
+
+    # The analysis is context for the CV prompt below, not the deliverable. If the
+    # model returns something unparseable, carry on with an empty analysis rather
+    # than failing a request the user is paying for.
+    analysis_json = parse_model_json(analysis_content)
+    if analysis_json is None:
+        logger.warning(
+            "analysis JSON unparseable model=%s length=%d; continuing without it",
+            selected_model, len(analysis_content or '')
+        )
+        analysis_json = {'note': 'Analysis unavailable for this request'}
 
     # 2. Use analysis_json in the optimization prompt
     prompt = f"""
@@ -746,20 +749,20 @@ def analyze_cv(
     
     try:
         analysis_content = chat_completion(
-            selected_model, prompt, temperature=0.3, max_tokens=2000)
-        
-        # Try to parse the JSON output
-        try:
-            analysis_json = pyjson.loads(analysis_content)
-        except Exception:
-            # Try to clean up if wrapped in markdown
-            if analysis_content.startswith('```json'):
-                analysis_content = analysis_content[7:]
-            if analysis_content.endswith('```'):
-                analysis_content = analysis_content[:-3]
-            analysis_content = analysis_content.strip()
-            analysis_json = pyjson.loads(analysis_content)
-        
+            selected_model, prompt, temperature=0.3,
+            max_tokens=ANALYSIS_MAX_TOKENS)
+
+        # Here the analysis IS the deliverable, so an unparseable reply is an error
+        # rather than something to continue past.
+        analysis_json = parse_model_json(analysis_content)
+        if analysis_json is None:
+            logger.warning("analysis JSON unparseable model=%s length=%d",
+                           selected_model, len(analysis_content or ''))
+            return JSONResponse(
+                {'error': 'The model did not return a usable analysis. Please retry.'},
+                status_code=502
+            )
+
         return JSONResponse({
             'message': 'CV analysis completed successfully',
             'analysis': analysis_json,

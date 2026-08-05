@@ -244,3 +244,90 @@ def test_health_unhealthy_without_api_key(client, monkeypatch):
     r = client.get('/health')
     assert r.status_code == 503
     assert r.json()['status'] == 'unhealthy'
+
+
+# --- analysis JSON parsing (production incident 2026-08-05) -----------------
+# A long CV made the analysis reply exceed max_tokens=2000, so it arrived
+# truncated mid-string and the unguarded second json.loads raised a 500.
+
+from utils import parse_model_json  # noqa: E402
+
+TRUNCATED = (
+    '```json\n'
+    '{\n'
+    '  "ats_score": 72,\n'
+    '  "keyword_match_percentage": 64,\n'
+    '  "missing_keywords": ["kubernetes", "terraform"],\n'
+    '  "strengths": ["Deep Python experience", "Led a team of six"],\n'
+    '  "recommendations": ["Add a metrics-driven summary", "Mention cloud cost w'
+)
+
+
+def test_parse_model_json_recovers_truncated_reply():
+    """The exact shape that took production down: fenced, then cut mid-string."""
+    parsed = parse_model_json(TRUNCATED)
+    assert parsed is not None
+    assert parsed['ats_score'] == 72
+    assert parsed['missing_keywords'] == ['kubernetes', 'terraform']
+    # the half-written recommendation is dropped, the complete one survives
+    assert 'Add a metrics-driven summary' in parsed['recommendations']
+
+
+@pytest.mark.parametrize('raw,expected', [
+    ('{"a": 1}', {'a': 1}),
+    ('```json\n{"a": 1}\n```', {'a': 1}),
+    ('```\n{"a": 1}\n```', {'a': 1}),
+    ('Here is the analysis:\n{"a": 1}\nHope that helps!', {'a': 1}),
+    ('{"a": [1, 2], "b": {"c": "d"}}', {'a': [1, 2], 'b': {'c': 'd'}}),
+    ('{"a": "say \\"hi\\" now"}', {'a': 'say "hi" now'}),
+])
+def test_parse_model_json_shapes(raw, expected):
+    assert parse_model_json(raw) == expected
+
+
+@pytest.mark.parametrize('raw', ['', '   ', 'no json here at all', '[1,2,3]', None])
+def test_parse_model_json_gives_up_cleanly(raw):
+    assert parse_model_json(raw) is None
+
+
+def test_truncated_analysis_no_longer_500s(client, monkeypatch):
+    """/optimize-cv must still return a CV when the analysis comes back broken."""
+    def fake_post(url, headers=None, json=None, **kwargs):
+        prompt = json['messages'][0]['content']
+        if 'Return ONLY the JSON object' in prompt:
+            return StubResponse(200, _completion(TRUNCATED))
+        return StubResponse(200, _completion(HTML))
+    monkeypatch.setattr(openrouter.requests, 'post', fake_post)
+
+    r = client.post('/optimize-cv', data={'cv_text': CV, 'job_desc_text': JD})
+    assert r.status_code == 200
+    assert r.json()['html_content'] == HTML
+    assert r.json()['analysis']['ats_score'] == 72
+
+
+def test_unsalvageable_analysis_still_returns_a_cv(client, monkeypatch):
+    def fake_post(url, headers=None, json=None, **kwargs):
+        prompt = json['messages'][0]['content']
+        if 'Return ONLY the JSON object' in prompt:
+            return StubResponse(200, _completion("I could not analyse that."))
+        return StubResponse(200, _completion(HTML))
+    monkeypatch.setattr(openrouter.requests, 'post', fake_post)
+
+    r = client.post('/optimize-cv', data={'cv_text': CV, 'job_desc_text': JD})
+    assert r.status_code == 200
+    assert r.json()['html_content'] == HTML
+    assert 'note' in r.json()['analysis']
+
+
+def test_analysis_uses_raised_token_ceiling(client, stub_openrouter):
+    client.post('/optimize-cv', data={'cv_text': CV, 'job_desc_text': JD})
+    assert stub_openrouter[0]['payload']['max_tokens'] == config.ANALYSIS_MAX_TOKENS
+    assert config.ANALYSIS_MAX_TOKENS > 2000
+
+
+def test_analyze_cv_reports_unusable_analysis(client, monkeypatch):
+    monkeypatch.setattr(openrouter.requests, 'post',
+                        lambda *a, **k: StubResponse(200, _completion('not json')))
+    r = client.post('/analyze-cv', data={'cv_text': CV, 'job_desc_text': JD})
+    assert r.status_code == 502
+    assert 'error' in r.json()

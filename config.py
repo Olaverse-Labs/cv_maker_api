@@ -5,11 +5,16 @@ load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = "anthropic/claude-sonnet-5"
+DEFAULT_MODEL = "openai/gpt-5.6-terra"
 
 # Seconds to wait on an OpenRouter call. Without this a hung connection holds a
 # worker thread forever; long CVs on slow models can legitimately take a while.
 OPENROUTER_TIMEOUT = int(os.getenv("OPENROUTER_TIMEOUT", "120"))
+
+# Token ceiling for the CV analysis step. This was 2000, which truncated the
+# analysis JSON mid-string on longer CVs and blew up the JSON parse. max_tokens
+# is a cap, not a spend, so raising it costs nothing on shorter replies.
+ANALYSIS_MAX_TOKENS = int(os.getenv("ANALYSIS_MAX_TOKENS", "6000"))
 
 # Sent to OpenRouter for dashboard attribution. Both optional.
 APP_URL = os.getenv("APP_URL", "")

@@ -1,3 +1,4 @@
+import json
 import tempfile
 import os
 import requests
@@ -10,6 +11,124 @@ from config import (
     GOTENBERG_PASSWORD,
     MAX_UPLOAD_BYTES,
 )
+
+
+def _strip_code_fence(text):
+    """Remove a leading ```json / ``` fence and any trailing fence."""
+    text = text.strip()
+    if text.startswith('```'):
+        newline = text.find('\n')
+        text = text[newline + 1:] if newline != -1 else text[3:]
+    if text.endswith('```'):
+        text = text[:-3]
+    return text.strip()
+
+
+def _repair_truncated_json(text):
+    """Close a JSON object that was cut off mid-generation.
+
+    Models hit their max_tokens partway through and return something like
+    '{"a": [1, 2], "b": "half a sen' — valid up to a point. Walk to the last
+    safe boundary and close whatever is still open.
+    """
+    stack = []
+    in_string = False
+    escaped = False
+    last_safe = None
+
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_string = False
+                # end of a string value is a safe place to stop
+                if stack:
+                    last_safe = i + 1
+        elif ch == '"':
+            in_string = True
+        elif ch in '{[':
+            stack.append('}' if ch == '{' else ']')
+        elif ch in '}]':
+            if stack:
+                stack.pop()
+            last_safe = i + 1
+        elif ch == ',':
+            last_safe = i  # drop the trailing comma
+        elif ch.isdigit() or ch in 'aeflnorstu':
+            # inside a bare literal (number/true/false/null); only safe once closed
+            pass
+
+    if last_safe is None:
+        return None
+
+    candidate = text[:last_safe].rstrip().rstrip(',')
+
+    # Recount what is still open at the truncation point.
+    stack = []
+    in_string = False
+    escaped = False
+    for ch in candidate:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in '{[':
+            stack.append('}' if ch == '{' else ']')
+        elif ch in '}]' and stack:
+            stack.pop()
+
+    return candidate + ''.join(reversed(stack))
+
+
+def parse_model_json(content):
+    """Best-effort parse of a JSON object from a model reply.
+
+    Returns the parsed dict, or None if nothing usable could be recovered.
+    Handles code fences, surrounding prose, and output truncated by max_tokens.
+    """
+    if not content or not content.strip():
+        return None
+
+    candidates = []
+    cleaned = _strip_code_fence(content)
+    candidates.append(cleaned)
+
+    # Ignore any prose before the first '{' or after the last '}'.
+    start = cleaned.find('{')
+    if start != -1:
+        end = cleaned.rfind('}')
+        if end > start:
+            candidates.append(cleaned[start:end + 1])
+        candidates.append(cleaned[start:])
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, TypeError):
+            continue
+
+    # Everything failed; the reply was probably cut off mid-object.
+    if start != -1:
+        repaired = _repair_truncated_json(cleaned[start:])
+        if repaired:
+            try:
+                parsed = json.loads(repaired)
+                if isinstance(parsed, dict):
+                    return parsed
+            except (ValueError, TypeError):
+                pass
+
+    return None
 
 
 class DocumentError(Exception):

@@ -218,6 +218,7 @@ This will test:
 - `GOTENBERG_USERNAME`: Gotenberg username (optional)
 - `GOTENBERG_PASSWORD`: Gotenberg password (optional)
 - `OPENROUTER_TIMEOUT`: Seconds to wait for a model response (default `120`)
+- `ANALYSIS_MAX_TOKENS`: Token ceiling for the analysis step (default `6000`)
 - `MAX_UPLOAD_MB`: Largest accepted upload per file (default `10`)
 - `CORS_ALLOW_ORIGINS`: Comma-separated origins, or `*` for any (default `*`)
 - `APP_URL` / `APP_TITLE`: Optional OpenRouter dashboard attribution
