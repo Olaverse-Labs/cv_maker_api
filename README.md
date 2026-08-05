@@ -6,21 +6,21 @@ A FastAPI-based service that uses AI to generate professional resumes and cover 
 
 ## Features
 
-- **AI-Powered Generation**: Uses advanced language models (GPT-4, Claude, Gemini) to optimize CVs and generate cover letters
+- **AI-Powered Generation**: Uses advanced language models (Claude, GPT-5, Gemini, Grok, DeepSeek) to optimize CVs and generate cover letters
 - **Three Design Styles**: 
   - **Classic Professional**: Traditional, conservative layout for finance, law, government
   - **Modern Minimal**: Clean, contemporary design for tech, creative, startup environments  
   - **Corporate Clean**: Professional design with highlighted header for corporate roles
 - **ATS-Friendly**: Optimized for Applicant Tracking Systems
 - **PDF Generation**: Convert HTML output to professional PDFs
-- **Multiple AI Models**: Support for GPT-4, Claude 3, Gemini Pro, and more
+- **Multiple AI Models**: Support for Claude Sonnet 5, GPT-5.6, Grok 4.5, Gemini, DeepSeek and more
 
 ## Quick Start
 
 ### 1. Install Dependencies
 
 ```bash
-pip install fastapi uvicorn python-multipart requests PyPDF2 python-docx python-dotenv
+pip install -r requirements.txt
 ```
 
 ### 2. Set Environment Variables
@@ -47,19 +47,15 @@ python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 ### Core Endpoints
 
-#### `POST /upload`
-Upload CV and job description documents.
+All generation endpoints take the CV and job description directly — there is no
+separate upload step. For each of the two documents, send **either** a file or
+raw text:
 
-**Parameters:**
-- `cv_file` (optional): PDF, DOCX, or TXT file
-- `cv_text` (optional): CV text content
-- `job_desc_file` (optional): PDF, DOCX, or TXT file  
-- `job_desc_text` (optional): Job description text
-- `full_name` (optional): Contact information
-- `address` (optional): Contact information
-- `city_state_zip` (optional): Contact information
-- `email` (optional): Contact information
-- `phone` (optional): Contact information
+- `cv_file` / `cv_text` — PDF, DOCX or TXT file, or the text itself
+- `job_desc_file` / `job_desc_text` — same, for the job description
+
+Files are capped at `MAX_UPLOAD_MB` (10MB by default); a larger one returns
+`413`. A missing document returns `400`.
 
 #### `POST /optimize-cv`
 Generate an optimized, ATS-friendly resume.
@@ -85,7 +81,27 @@ Analyze CV against job description.
 ### Information Endpoints
 
 #### `GET /available-models`
-Get list of available AI models.
+Get list of available AI models, the default key, and full per-model metadata.
+
+#### `GET /health`
+Service health plus the state of both external dependencies.
+
+- `healthy` (200) — OpenRouter key configured and Gotenberg reachable
+- `degraded` (200) — generation works, PDF conversion unavailable
+- `unhealthy` (503) — no OpenRouter API key, nothing can run
+
+```json
+{
+  "status": "healthy",
+  "service": "cv-maker-api",
+  "default_model": "anthropic/claude-sonnet-5",
+  "available_models": 7,
+  "checks": {
+    "openrouter": {"configured": true, "base_url": "https://openrouter.ai/api/v1"},
+    "gotenberg": {"url": "http://localhost:3000", "reachable": true}
+  }
+}
+```
 
 ## Design Styles
 
@@ -96,13 +112,25 @@ Get list of available AI models.
 
 ## Available AI Models
 
-- **GPT-4**: Most capable model, best for complex tasks
-- **GPT-4 Turbo**: Fast and efficient, good for most tasks
-- **GPT-3.5 Turbo**: Fast and cost-effective for simple tasks
-- **Claude 3 Opus**: Highly capable model, excellent for analysis
-- **Claude 3 Sonnet**: Balanced performance and cost
-- **Claude 3 Haiku**: Fast and efficient for simple tasks
-- **Gemini Pro**: Google's advanced language model
+Pass the key in the `model` form field. Defaults to `claude-sonnet-5`.
+Prices are USD per million tokens (input / output).
+
+| Key | Model | Best for | Price |
+| --- | --- | --- | --- |
+| `claude-sonnet-5` *(default)* | Claude Sonnet 5 | Best all-round writing quality and reliable HTML/JSON output | $2 / $10 |
+| `gpt-5.6-terra` | GPT-5.6 Terra | Tailoring CVs to job descriptions | $1 / $6 |
+| `grok-4.5` | Grok 4.5 | Punchier, less formulaic writing | $2 / $6 |
+| `claude-haiku-4.5` | Claude Haiku 4.5 | Fast extraction and short cover letters | $1 / $5 |
+| `gpt-5.4-mini` | GPT-5.4 Mini | Low-cost routine rewrites | $0.75 / $4.50 |
+| `gemini-3.5-flash-lite` | Gemini 3.5 Flash Lite | Bulk generation and quick drafts | $0.30 / $2.50 |
+| `deepseek-v4-pro` | DeepSeek V4 Pro | Cheapest option, high-volume use | $0.44 / $0.87 |
+
+`gpt-5.6-terra` doubles as the legacy model: every retired key (`gpt-4`,
+`gpt-4-turbo`, `gpt-3.5-turbo`, `claude-3-opus`, `claude-3-sonnet`, `claude-3-haiku`,
+`gemini-pro`, `llama-3`, `mixtral-8x7b`) routes to it, so existing clients keep
+working. Unknown keys fall back to the default.
+
+Call `GET /available-models` for the live list with full metadata.
 
 ## Usage Examples
 
@@ -111,39 +139,43 @@ Get list of available AI models.
 ```python
 import requests
 
-# Upload documents
-upload_data = {
+# Everything goes in a single call
+cv_data = {
     'cv_text': 'Your CV content here...',
     'job_desc_text': 'Job description here...',
     'full_name': 'John Doe',
-    'email': 'john@example.com'
-}
-
-response = requests.post('http://localhost:8000/upload', data=upload_data)
-
-# Generate optimized CV
-cv_data = {
-    'model': 'gpt-4',
+    'email': 'john@example.com',
+    'model': 'claude-sonnet-5',
+    'style': 'classic',
     'generate_pdf': False
 }
 
 response = requests.post('http://localhost:8000/optimize-cv', data=cv_data)
 result = response.json()
 html_content = result['html_content']
+analysis = result['analysis']
+```
+
+Or send the CV as a file:
+
+```python
+with open('cv.pdf', 'rb') as f:
+    response = requests.post(
+        'http://localhost:8000/optimize-cv',
+        files={'cv_file': f},
+        data={'job_desc_text': 'Job description here...'}
+    )
 ```
 
 ### cURL Example
 
 ```bash
-# Upload documents
-curl -X POST "http://localhost:8000/upload" \
-  -F "cv_text=Your CV content here..." \
-  -F "job_desc_text=Job description here..." \
-  -F "full_name=John Doe"
-
 # Generate CV with PDF
 curl -X POST "http://localhost:8000/optimize-cv" \
-  -F "model=gpt-4" \
+  -F "cv_text=Your CV content here..." \
+  -F "job_desc_text=Job description here..." \
+  -F "full_name=John Doe" \
+  -F "model=claude-sonnet-5" \
   -F "generate_pdf=true" \
   --output optimized_cv.pdf
 ```
@@ -155,7 +187,7 @@ curl -X POST "http://localhost:8000/optimize-cv" \
 {
   "message": "CV optimized successfully",
   "html_content": "<!DOCTYPE html>...",
-  "model_used": "openai/gpt-4"
+  "model_used": "anthropic/claude-sonnet-5"
 }
 ```
 
@@ -171,7 +203,6 @@ python test_api.py
 ```
 
 This will test:
-- Document upload
 - CV optimization
 - Cover letter generation
 - CV analysis
@@ -186,6 +217,20 @@ This will test:
 - `GOTENBERG_URL`: Gotenberg server URL for PDF generation (optional)
 - `GOTENBERG_USERNAME`: Gotenberg username (optional)
 - `GOTENBERG_PASSWORD`: Gotenberg password (optional)
+- `OPENROUTER_TIMEOUT`: Seconds to wait for a model response (default `120`)
+- `MAX_UPLOAD_MB`: Largest accepted upload per file (default `10`)
+- `CORS_ALLOW_ORIGINS`: Comma-separated origins, or `*` for any (default `*`)
+- `APP_URL` / `APP_TITLE`: Optional OpenRouter dashboard attribution
+- `LOG_LEVEL`: Logging level (default `INFO`)
+
+### Running the tests
+
+```bash
+pip install pytest
+pytest
+```
+
+Tests stub OpenRouter, so they never make a network call or spend credits.
 
 ### Customization
 
@@ -197,7 +242,10 @@ AVAILABLE_MODELS["your-model"] = {
     "id": "provider/model-name",
     "name": "Display Name",
     "description": "Model description",
-    "max_tokens": 4000,
+    "context_length": 200000,
+    "tier": "balanced",
+    "price_per_m": {"input": 1.00, "output": 5.00},
+    "max_tokens": 8000,
     "temperature": 0.7
 }
 ```

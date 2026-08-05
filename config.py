@@ -5,41 +5,131 @@ load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = "openai/gpt-4-turbo"
+DEFAULT_MODEL = "anthropic/claude-sonnet-5"
 
-# Only reasoning-capable models
+# Seconds to wait on an OpenRouter call. Without this a hung connection holds a
+# worker thread forever; long CVs on slow models can legitimately take a while.
+OPENROUTER_TIMEOUT = int(os.getenv("OPENROUTER_TIMEOUT", "120"))
+
+# Sent to OpenRouter for dashboard attribution. Both optional.
+APP_URL = os.getenv("APP_URL", "")
+APP_TITLE = os.getenv("APP_TITLE", "CV Maker API")
+
+# Largest upload accepted per file, in bytes. Guards against a huge PDF being
+# read straight into memory.
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "10")) * 1024 * 1024
+
+# Comma-separated list of allowed CORS origins, or "*" for any.
+CORS_ALLOW_ORIGINS = [
+    o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()
+]
+
+# Reasoning-capable models suited to CV rewriting, ATS optimisation and
+# long-form cover letter generation. All IDs verified against OpenRouter.
+# Flagship tiers (Opus, GPT-5.6 Sol, GPT-4 Turbo) are deliberately excluded on
+# cost grounds. Prices are USD per million tokens.
 AVAILABLE_MODELS = {
-    "gpt-4-turbo": {
-        "id": "openai/gpt-4-turbo",
-        "name": "GPT-4 Turbo",
-        "description": "Fast and efficient, best for complex reasoning tasks",
-        "max_tokens": 4000,
+    "claude-sonnet-5": {
+        "id": "anthropic/claude-sonnet-5",
+        "name": "Claude Sonnet 5",
+        "description": "Best all-round choice: strong professional writing, reliable JSON and HTML output",
+        "context_length": 1000000,
+        "tier": "balanced",
+        "price_per_m": {"input": 2.00, "output": 10.00},
+        "max_tokens": 8000,
         "temperature": 0.7
     },
-    "claude-3-opus": {
-        "id": "anthropic/claude-3-opus",
-        "name": "Claude 3 Opus",
-        "description": "Highly capable model, excellent for analysis and reasoning",
-        "max_tokens": 4000,
+    "gpt-5.6-terra": {
+        "id": "openai/gpt-5.6-terra",
+        "name": "GPT-5.6 Terra",
+        "description": "Strong OpenAI model for tailoring CVs to job descriptions, mid-tier pricing. Also serves all retired model keys",
+        "context_length": 1050000,
+        "tier": "balanced",
+        "price_per_m": {"input": 1.00, "output": 6.00},
+        "max_tokens": 8000,
         "temperature": 0.7
     },
-    "llama-3": {
-        "id": "meta-llama/llama-3-70b",
-        "name": "Llama 3",
-        "description": "Meta's advanced open model for reasoning and generation",
-        "max_tokens": 4000,
+    "grok-4.5": {
+        "id": "x-ai/grok-4.5",
+        "name": "Grok 4.5",
+        "description": "Capable general model with a punchier, less formulaic writing style",
+        "context_length": 500000,
+        "tier": "balanced",
+        "price_per_m": {"input": 2.00, "output": 6.00},
+        "max_tokens": 8000,
         "temperature": 0.7
     },
-    "mixtral-8x7b": {
-        "id": "mistral/mixtral-8x7b",
-        "name": "Mixtral 8x7B",
-        "description": "Mistral's mixture-of-experts model for strong reasoning",
-        "max_tokens": 4000,
+    "claude-haiku-4.5": {
+        "id": "anthropic/claude-haiku-4.5",
+        "name": "Claude Haiku 4.5",
+        "description": "Fast, cheap Claude model for structured extraction and short cover letters",
+        "context_length": 200000,
+        "tier": "fast",
+        "price_per_m": {"input": 1.00, "output": 5.00},
+        "max_tokens": 8000,
+        "temperature": 0.7
+    },
+    "gpt-5.4-mini": {
+        "id": "openai/gpt-5.4-mini",
+        "name": "GPT-5.4 Mini",
+        "description": "Low-cost OpenAI model, good quality for routine CV rewrites",
+        "context_length": 400000,
+        "tier": "fast",
+        "price_per_m": {"input": 0.75, "output": 4.50},
+        "max_tokens": 8000,
+        "temperature": 0.7
+    },
+    "gemini-3.5-flash-lite": {
+        "id": "google/gemini-3.5-flash-lite",
+        "name": "Gemini 3.5 Flash Lite",
+        "description": "Very fast and inexpensive, good for bulk generation and quick drafts",
+        "context_length": 1048576,
+        "tier": "budget",
+        "price_per_m": {"input": 0.30, "output": 2.50},
+        "max_tokens": 8000,
+        "temperature": 0.7
+    },
+    "deepseek-v4-pro": {
+        "id": "deepseek/deepseek-v4-pro",
+        "name": "DeepSeek V4 Pro",
+        "description": "Cheapest option with solid reasoning, best value for high-volume use",
+        "context_length": 1048576,
+        "tier": "budget",
+        "price_per_m": {"input": 0.44, "output": 0.87},
+        "max_tokens": 8000,
         "temperature": 0.7
     }
 }
 
+# Model serving retired keys. Old clients still send model names that no longer
+# exist on OpenRouter; every one of them is routed here rather than failing.
+LEGACY_MODEL = "gpt-5.6-terra"
+
+# Old model keys that clients may still send, all mapped to LEGACY_MODEL.
+LEGACY_MODEL_ALIASES = {
+    "gpt-4-turbo": LEGACY_MODEL,
+    "gpt-4": LEGACY_MODEL,
+    "gpt-3.5-turbo": LEGACY_MODEL,
+    "claude-3-opus": LEGACY_MODEL,
+    "claude-3-sonnet": LEGACY_MODEL,
+    "claude-3-haiku": LEGACY_MODEL,
+    "gemini-pro": LEGACY_MODEL,
+    "llama-3": LEGACY_MODEL,
+    "mixtral-8x7b": LEGACY_MODEL
+}
+
+
+def resolve_model(model_key):
+    """Return the OpenRouter model ID for a client-supplied key, or the default."""
+    if not model_key:
+        return DEFAULT_MODEL
+    model_key = LEGACY_MODEL_ALIASES.get(model_key, model_key)
+    if model_key in AVAILABLE_MODELS:
+        return AVAILABLE_MODELS[model_key]['id']
+    return DEFAULT_MODEL
+
+
 # Gotenberg PDF generation settings
 GOTENBERG_URL = os.getenv("GOTENBERG_URL", "http://localhost:3000")
 GOTENBERG_USERNAME = os.getenv("GOTENBERG_USERNAME", "")
-GOTENBERG_PASSWORD = os.getenv("GOTENBERG_PASSWORD", "") 
+GOTENBERG_PASSWORD = os.getenv("GOTENBERG_PASSWORD", "")

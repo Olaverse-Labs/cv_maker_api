@@ -1,17 +1,32 @@
-import io
+import logging
 from typing import Optional
-from PyPDF2 import PdfReader
-from docx import Document
 from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 import requests
-from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL, AVAILABLE_MODELS, GOTENBERG_URL, GOTENBERG_USERNAME, GOTENBERG_PASSWORD
+from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL, AVAILABLE_MODELS, resolve_model, GOTENBERG_URL, GOTENBERG_USERNAME, GOTENBERG_PASSWORD, CORS_ALLOW_ORIGINS
 import tempfile
 import os
-from utils import convert_html_to_pdf
+from utils import convert_html_to_pdf, extract_document_text, DocumentError
+from templates import get_style_template
+from openrouter import chat_completion, OpenRouterError
 import json as pyjson
 
-app = FastAPI()
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s"
+)
+logger = logging.getLogger("cv_maker_api")
+
+app = FastAPI(title="CV Maker API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # 1. Remove global variables for cv_text_storage, job_desc_text_storage, contact_info_storage
 # 2. Remove /upload endpoint
@@ -35,1030 +50,19 @@ def optimize_cv(
     style: str = Form("classic"),
     user_query: str = Form(None) # New optional parameter
 ):
-    # Process CV
-    cv_extracted_text = None
-    if cv_file:
-        if cv_file.filename.endswith('.pdf'):
-            pdf_reader = PdfReader(cv_file.file)
-            cv_extracted_text = " ".join(page.extract_text() or '' for page in pdf_reader.pages)
-        elif cv_file.filename.endswith('.docx'):
-            doc = Document(cv_file.file)
-            cv_extracted_text = " ".join([para.text for para in doc.paragraphs])
-        elif cv_file.filename.endswith('.txt'):
-            cv_extracted_text = cv_file.file.read().decode('utf-8')
-        else:
-            return JSONResponse({'error': 'Unsupported CV file type. Use PDF, DOCX, or TXT'}, status_code=400)
-    elif cv_text:
-        cv_extracted_text = cv_text
-    else:
-        return JSONResponse({'error': 'No CV provided (file or text)'}, status_code=400)
-    
-    # Process Job Description
-    job_desc_extracted_text = None
-    if job_desc_file:
-        if job_desc_file.filename.endswith('.pdf'):
-            pdf_reader = PdfReader(job_desc_file.file)
-            job_desc_extracted_text = " ".join(page.extract_text() or '' for page in pdf_reader.pages)
-        elif job_desc_file.filename.endswith('.docx'):
-            doc = Document(job_desc_file.file)
-            job_desc_extracted_text = " ".join([para.text for para in doc.paragraphs])
-        elif job_desc_file.filename.endswith('.txt'):
-            job_desc_extracted_text = job_desc_file.file.read().decode('utf-8')
-        else:
-            return JSONResponse({'error': 'Unsupported job description file type. Use PDF, DOCX, or TXT'}, status_code=400)
-    elif job_desc_text:
-        job_desc_extracted_text = job_desc_text
-    else:
-        return JSONResponse({'error': 'No job description provided (file or text)'}, status_code=400)
+    # Read the CV and job description from either an upload or raw text
+    try:
+        cv_extracted_text = extract_document_text(cv_file, cv_text, 'CV')
+        job_desc_extracted_text = extract_document_text(
+            job_desc_file, job_desc_text, 'job description')
+    except DocumentError as e:
+        return JSONResponse({'error': e.message}, status_code=e.status_code)
     
     # Use provided model or fall back to default
-    selected_model = DEFAULT_MODEL
-    if model and model in AVAILABLE_MODELS:
-        selected_model = AVAILABLE_MODELS[model]['id']
+    selected_model = resolve_model(model)
     
     # Select template based on style
-    if style == "modern":
-        template_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Modern Minimal Resume</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Arial', sans-serif;
-            line-height: 1.4;
-            color: #333;
-            background: #f5f5f5;
-            padding: 0px;
-        }
-
-        .resume {
-            max-width: 8.5in;
-            margin: 0 auto;
-            background: white;
-            padding: 0px;
-            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-        }
-
-        .header {
-            text-align: left;
-            margin-bottom: 30px;
-            padding: 20px 0;
-            border-left: 5px solid #e74c3c;
-            padding-left: 20px;
-        }
-
-        .name {
-            font-size: 32px;
-            font-weight: 300;
-            margin-bottom: 8px;
-            color: #2c3e50;
-        }
-
-        .contact-info {
-            font-size: 11px;
-            color: #666;
-        }
-
-        .contact-info span {
-            margin: 0 10px;
-        }
-
-        .section {
-            margin-bottom: 25px;
-        }
-
-        .section-title {
-            font-size: 14px;
-            font-weight: 600;
-            color: #e74c3c;
-            text-transform: uppercase;
-            margin-bottom: 15px;
-            letter-spacing: 1px;
-        }
-
-        .job-entry, .education-entry {
-            margin-bottom: 15px;
-        }
-
-        .job-title {
-            font-weight: bold;
-            font-size: 12px;
-        }
-
-        .company {
-            font-size: 12px;
-            color: #555;
-        }
-
-        .date-location {
-            font-size: 11px;
-            color: #777;
-            float: right;
-        }
-
-        .job-description {
-            font-size: 11px;
-            margin-top: 6px;
-        }
-
-        .job-description li {
-            margin-bottom: 3px;
-            margin-left: 18px;
-        }
-
-        .skills-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 15px;
-            font-size: 11px;
-        }
-
-        .skill-category {
-            margin-bottom: 10px;
-        }
-
-        .skill-category strong {
-            font-size: 11px;
-            display: block;
-            margin-bottom: 4px;
-        }
-
-        .clearfix::after {
-            content: "";
-            display: table;
-            clear: both;
-        }
-
-        @media print {
-            body {
-                background: white;
-                padding: 0;
-            }
-            
-            .resume {
-                box-shadow: none;
-                padding: 0.5in;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="resume">
-        <div class="header">
-            <div class="name">JOHN SMITH</div>
-            <div class="contact-info">
-                <span>john.smith@email.com</span>
-                <span>•</span>
-                <span>(555) 123-4567</span>
-                <span>•</span>
-                <span>New York, NY</span>
-                <span>•</span>
-                <span>linkedin.com/in/johnsmith</span>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Summary</div>
-            <p style="font-size: 11px; line-height: 1.5;">
-                Results-driven professional with 5+ years of experience in project management and business analysis. 
-                Proven track record of delivering projects on time and within budget while improving operational efficiency by 25%. 
-                Strong analytical skills with expertise in data analysis, process improvement, and cross-functional team leadership.
-            </p>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Experience</div>
-            
-            <div class="job-entry clearfix">
-                <div class="job-title">Senior Project Manager</div>
-                <div class="date-location">2022 - Present</div>
-                <div class="company">ABC Corporation, New York, NY</div>
-                <ul class="job-description">
-                    <li>Led cross-functional teams of 8-12 members to deliver 15+ projects worth $2M+ annually</li>
-                    <li>Implemented agile methodologies resulting in 30% improvement in project delivery time</li>
-                    <li>Managed stakeholder relationships and communicated project status to C-level executives</li>
-                    <li>Reduced project costs by 15% through process optimization and vendor negotiations</li>
-                </ul>
-            </div>
-
-            <div class="job-entry clearfix">
-                <div class="job-title">Business Analyst</div>
-                <div class="date-location">2020 - 2021</div>
-                <div class="company">XYZ Solutions, New York, NY</div>
-                <ul class="job-description">
-                    <li>Analyzed business processes and identified opportunities for improvement</li>
-                    <li>Created detailed requirements documentation and user stories for development teams</li>
-                    <li>Collaborated with IT and business units to implement system enhancements</li>
-                    <li>Conducted data analysis using SQL and Excel to support business decisions</li>
-                </ul>
-            </div>
-
-            <div class="job-entry clearfix">
-                <div class="job-title">Project Coordinator</div>
-                <div class="date-location">2019 - 2020</div>
-                <div class="company">DEF Industries, New York, NY</div>
-                <ul class="job-description">
-                    <li>Coordinated project activities and maintained project schedules using MS Project</li>
-                    <li>Prepared status reports and presentations for senior management</li>
-                    <li>Facilitated team meetings and documented action items and decisions</li>
-                </ul>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Education</div>
-            <div class="education-entry clearfix">
-                <div class="job-title">Bachelor of Science in Business Administration</div>
-                <div class="date-location">2019</div>
-                <div class="company">University of New York, New York, NY</div>
-                <div style="font-size: 11px; margin-top: 2px;">Magna Cum Laude, GPA: 3.8/4.0</div>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Skills</div>
-            <div class="skills-grid">
-                <div>
-                    <div class="skill-category">
-                        <strong>Project Management:</strong>
-                        Agile, Scrum, Waterfall, MS Project, Jira, Risk Management
-                    </div>
-                    <div class="skill-category">
-                        <strong>Technical:</strong>
-                        SQL, Excel, Power BI, Tableau, Python, HTML/CSS
-                    </div>
-                </div>
-                <div>
-                    <div class="skill-category">
-                        <strong>Business Analysis:</strong>
-                        Requirements Gathering, Process Mapping, Gap Analysis, UAT
-                    </div>
-                    <div class="skill-category">
-                        <strong>Soft Skills:</strong>
-                        Leadership, Communication, Problem-Solving, Team Building
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Certifications</div>
-            <div style="font-size: 11px;">
-                <div style="margin-bottom: 4px;">• Project Management Professional (PMP) - Project Management Institute, 2023</div>
-                <div style="margin-bottom: 4px;">• Certified Scrum Master (CSM) - Scrum Alliance, 2022</div>
-                <div>• Google Data Analytics Professional Certificate - Google, 2021</div>
-            </div>
-        </div>
-    </div>
-</body>
-</html>
-"""
-    elif style == "minimal":
-        template_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Modern Minimal Resume</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Arial', sans-serif;
-            line-height: 1.4;
-            color: #333;
-            background: #f5f5f5;
-            padding: 0px;
-        }
-
-        .resume {
-            max-width: 8.5in;
-            margin: 0 auto;
-            background: white;
-            padding: 0px;
-            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-        }
-
-        .header {
-            text-align: left;
-            margin-bottom: 30px;
-            padding: 20px 0;
-            border-left: 5px solid #e74c3c;
-            padding-left: 20px;
-        }
-
-        .name {
-            font-size: 32px;
-            font-weight: 300;
-            margin-bottom: 8px;
-            color: #2c3e50;
-        }
-
-        .contact-info {
-            font-size: 11px;
-            color: #666;
-        }
-
-        .contact-info span {
-            margin: 0 10px;
-        }
-
-        .section {
-            margin-bottom: 25px;
-        }
-
-        .section-title {
-            font-size: 14px;
-            font-weight: 600;
-            color: #e74c3c;
-            text-transform: uppercase;
-            margin-bottom: 15px;
-            letter-spacing: 1px;
-        }
-
-        .job-entry, .education-entry {
-            margin-bottom: 15px;
-        }
-
-        .job-title {
-            font-weight: bold;
-            font-size: 12px;
-        }
-
-        .company {
-            font-size: 12px;
-            color: #555;
-        }
-
-        .date-location {
-            font-size: 11px;
-            color: #777;
-            float: right;
-        }
-
-        .job-description {
-            font-size: 11px;
-            margin-top: 6px;
-        }
-
-        .job-description li {
-            margin-bottom: 3px;
-            margin-left: 18px;
-        }
-
-        .skills-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 15px;
-            font-size: 11px;
-        }
-
-        .skill-category {
-            margin-bottom: 10px;
-        }
-
-        .skill-category strong {
-            font-size: 11px;
-            display: block;
-            margin-bottom: 4px;
-        }
-
-        .clearfix::after {
-            content: "";
-            display: table;
-            clear: both;
-        }
-
-        @media print {
-            body {
-                background: white;
-                padding: 0;
-            }
-            
-            .resume {
-                box-shadow: none;
-                padding: 0.5in;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="resume">
-        <div class="header">
-            <div class="name">JOHN SMITH</div>
-            <div class="contact-info">
-                <span>john.smith@email.com</span>
-                <span>•</span>
-                <span>(555) 123-4567</span>
-                <span>•</span>
-                <span>New York, NY</span>
-                <span>•</span>
-                <span>linkedin.com/in/johnsmith</span>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Summary</div>
-            <p style="font-size: 11px; line-height: 1.5;">
-                Results-driven professional with 5+ years of experience in project management and business analysis. 
-                Proven track record of delivering projects on time and within budget while improving operational efficiency by 25%. 
-                Strong analytical skills with expertise in data analysis, process improvement, and cross-functional team leadership.
-            </p>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Experience</div>
-            
-            <div class="job-entry clearfix">
-                <div class="job-title">Senior Project Manager</div>
-                <div class="date-location">2022 - Present</div>
-                <div class="company">ABC Corporation, New York, NY</div>
-                <ul class="job-description">
-                    <li>Led cross-functional teams of 8-12 members to deliver 15+ projects worth $2M+ annually</li>
-                    <li>Implemented agile methodologies resulting in 30% improvement in project delivery time</li>
-                    <li>Managed stakeholder relationships and communicated project status to C-level executives</li>
-                    <li>Reduced project costs by 15% through process optimization and vendor negotiations</li>
-                </ul>
-            </div>
-
-            <div class="job-entry clearfix">
-                <div class="job-title">Business Analyst</div>
-                <div class="date-location">2020 - 2021</div>
-                <div class="company">XYZ Solutions, New York, NY</div>
-                <ul class="job-description">
-                    <li>Analyzed business processes and identified opportunities for improvement</li>
-                    <li>Created detailed requirements documentation and user stories for development teams</li>
-                    <li>Collaborated with IT and business units to implement system enhancements</li>
-                    <li>Conducted data analysis using SQL and Excel to support business decisions</li>
-                </ul>
-            </div>
-
-            <div class="job-entry clearfix">
-                <div class="job-title">Project Coordinator</div>
-                <div class="date-location">2019 - 2020</div>
-                <div class="company">DEF Industries, New York, NY</div>
-                <ul class="job-description">
-                    <li>Coordinated project activities and maintained project schedules using MS Project</li>
-                    <li>Prepared status reports and presentations for senior management</li>
-                    <li>Facilitated team meetings and documented action items and decisions</li>
-                </ul>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Education</div>
-            <div class="education-entry clearfix">
-                <div class="job-title">Bachelor of Science in Business Administration</div>
-                <div class="date-location">2019</div>
-                <div class="company">University of New York, New York, NY</div>
-                <div style="font-size: 11px; margin-top: 2px;">Magna Cum Laude, GPA: 3.8/4.0</div>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Skills</div>
-            <div class="skills-grid">
-                <div>
-                    <div class="skill-category">
-                        <strong>Project Management:</strong>
-                        Agile, Scrum, Waterfall, MS Project, Jira, Risk Management
-                    </div>
-                    <div class="skill-category">
-                        <strong>Technical:</strong>
-                        SQL, Excel, Power BI, Tableau, Python, HTML/CSS
-                    </div>
-                </div>
-                <div>
-                    <div class="skill-category">
-                        <strong>Business Analysis:</strong>
-                        Requirements Gathering, Process Mapping, Gap Analysis, UAT
-                    </div>
-                    <div class="skill-category">
-                        <strong>Soft Skills:</strong>
-                        Leadership, Communication, Problem-Solving, Team Building
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Certifications</div>
-            <div style="font-size: 11px;">
-                <div style="margin-bottom: 4px;">• Project Management Professional (PMP) - Project Management Institute, 2023</div>
-                <div style="margin-bottom: 4px;">• Certified Scrum Master (CSM) - Scrum Alliance, 2022</div>
-                <div>• Google Data Analytics Professional Certificate - Google, 2021</div>
-            </div>
-        </div>
-    </div>
-</body>
-</html>
-"""
-    elif style == "creative":
-        template_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Creative Professional Resume</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Arial', sans-serif;
-            line-height: 1.4;
-            color: #333;
-            background: #f5f5f5;
-            padding: 0px;
-        }
-
-        .resume {
-            max-width: 8.5in;
-            margin: 0 auto;
-            background: white;
-            padding: 0px;
-            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-        }
-
-        .header {
-            text-align: center;
-            margin-bottom: 25px;
-        }
-
-        .name {
-            font-size: 26px;
-            font-weight: bold;
-            margin-bottom: 10px;
-            color: #27ae60;
-        }
-
-        .contact-info {
-            font-size: 11px;
-            color: #666;
-        }
-
-        .contact-info span {
-            margin: 0 10px;
-        }
-
-        .section {
-            margin-bottom: 20px;
-        }
-
-        .section-title {
-            font-size: 14px;
-            font-weight: bold;
-            color: #27ae60;
-            text-transform: uppercase;
-            margin-bottom: 10px;
-            position: relative;
-            padding-left: 15px;
-        }
-
-        .section-title::before {
-            content: "▶";
-            position: absolute;
-            left: 0;
-            color: #27ae60;
-        }
-
-        .job-entry, .education-entry {
-            margin-bottom: 15px;
-        }
-
-        .job-title {
-            font-weight: bold;
-            font-size: 12px;
-        }
-
-        .company {
-            font-size: 12px;
-            color: #555;
-        }
-
-        .date-location {
-            font-size: 11px;
-            color: #777;
-            float: right;
-        }
-
-        .job-description {
-            font-size: 11px;
-            margin-top: 6px;
-        }
-
-        .job-description li {
-            margin-bottom: 3px;
-            margin-left: 18px;
-        }
-
-        .skills-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 15px;
-            font-size: 11px;
-        }
-
-        .skill-category {
-            margin-bottom: 10px;
-        }
-
-        .skill-category strong {
-            font-size: 11px;
-            display: block;
-            margin-bottom: 4px;
-        }
-
-        .clearfix::after {
-            content: "";
-            display: table;
-            clear: both;
-        }
-
-        @media print {
-            body {
-                background: white;
-                padding: 0;
-            }
-            
-            .resume {
-                box-shadow: none;
-                padding: 0.5in;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="resume">
-        <div class="header">
-            <div class="name">JOHN SMITH</div>
-            <div class="contact-info">
-                <span>john.smith@email.com</span>
-                <span>•</span>
-                <span>(555) 123-4567</span>
-                <span>•</span>
-                <span>New York, NY</span>
-                <span>•</span>
-                <span>linkedin.com/in/johnsmith</span>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">About Me</div>
-            <p style="font-size: 11px; line-height: 1.4;">
-                Results-driven professional with 5+ years of experience in project management and business analysis. 
-                Passionate about transforming ideas into reality through innovative solutions and strategic thinking. 
-                Strong analytical skills with expertise in data analysis, process improvement, and cross-functional team leadership.
-            </p>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Experience</div>
-            
-            <div class="job-entry clearfix">
-                <div class="job-title">Senior Project Manager</div>
-                <div class="date-location">2022 - Present</div>
-                <div class="company">ABC Corporation, New York, NY</div>
-                <ul class="job-description">
-                    <li>Led cross-functional teams of 8-12 members to deliver 15+ projects worth $2M+ annually</li>
-                    <li>Implemented agile methodologies resulting in 30% improvement in project delivery time</li>
-                    <li>Managed stakeholder relationships and communicated project status to C-level executives</li>
-                    <li>Reduced project costs by 15% through process optimization and vendor negotiations</li>
-                </ul>
-            </div>
-
-            <div class="job-entry clearfix">
-                <div class="job-title">Business Analyst</div>
-                <div class="date-location">2020 - 2021</div>
-                <div class="company">XYZ Solutions, New York, NY</div>
-                <ul class="job-description">
-                    <li>Analyzed business processes and identified opportunities for improvement</li>
-                    <li>Created detailed requirements documentation and user stories for development teams</li>
-                    <li>Collaborated with IT and business units to implement system enhancements</li>
-                    <li>Conducted data analysis using SQL and Excel to support business decisions</li>
-                </ul>
-            </div>
-
-            <div class="job-entry clearfix">
-                <div class="job-title">Project Coordinator</div>
-                <div class="date-location">2019 - 2020</div>
-                <div class="company">DEF Industries, New York, NY</div>
-                <ul class="job-description">
-                    <li>Coordinated project activities and maintained project schedules using MS Project</li>
-                    <li>Prepared status reports and presentations for senior management</li>
-                    <li>Facilitated team meetings and documented action items and decisions</li>
-                </ul>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Education</div>
-            <div class="education-entry clearfix">
-                <div class="job-title">Bachelor of Science in Business Administration</div>
-                <div class="date-location">2019</div>
-                <div class="company">University of New York, New York, NY</div>
-                <div style="font-size: 11px; margin-top: 2px;">Magna Cum Laude, GPA: 3.8/4.0</div>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Skills & Expertise</div>
-            <div class="skills-grid">
-                <div>
-                    <div class="skill-category">
-                        <strong>Project Management:</strong>
-                        Agile, Scrum, Waterfall, MS Project, Jira, Risk Management
-                    </div>
-                    <div class="skill-category">
-                        <strong>Technical:</strong>
-                        SQL, Excel, Power BI, Tableau, Python, HTML/CSS
-                    </div>
-                </div>
-                <div>
-                    <div class="skill-category">
-                        <strong>Business Analysis:</strong>
-                        Requirements Gathering, Process Mapping, Gap Analysis, UAT
-                    </div>
-                    <div class="skill-category">
-                        <strong>Soft Skills:</strong>
-                        Leadership, Communication, Problem-Solving, Team Building
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Certifications</div>
-            <div style="font-size: 11px;">
-                <div style="margin-bottom: 4px;">• Project Management Professional (PMP) - Project Management Institute, 2023</div>
-                <div style="margin-bottom: 4px;">• Certified Scrum Master (CSM) - Scrum Alliance, 2022</div>
-                <div>• Google Data Analytics Professional Certificate - Google, 2021</div>
-            </div>
-        </div>
-    </div>
-</body>
-</html>
-"""
-    else: # Default to classic
-        template_html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Classic Professional Resume</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Arial', sans-serif;
-            line-height: 1.4;
-            color: #333;
-            background: #f5f5f5;
-            padding: 0px;
-        }
-
-        .resume {
-            max-width: 8.5in;
-            margin: 0 auto;
-            background: white;
-            padding: 0px;
-            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-        }
-
-        .header {
-            text-align: center;
-            margin-bottom: 25px;
-            padding-bottom: 20px;
-            border-bottom: 3px solid #2c3e50;
-        }
-
-        .name {
-            font-size: 28px;
-            font-weight: bold;
-            margin-bottom: 10px;
-            color: #2c3e50;
-        }
-
-        .contact-info {
-            font-size: 11px;
-            color: #666;
-        }
-
-        .contact-info span {
-            margin: 0 10px;
-        }
-
-        .section {
-            margin-bottom: 20px;
-        }
-
-        .section-title {
-            font-size: 16px;
-            font-weight: bold;
-            color: #2c3e50;
-            text-transform: uppercase;
-            margin-bottom: 10px;
-            padding-bottom: 5px;
-            border-bottom: 2px solid #3498db;
-        }
-
-        .job-entry, .education-entry {
-            margin-bottom: 15px;
-        }
-
-        .job-title {
-            font-weight: bold;
-            font-size: 12px;
-        }
-
-        .company {
-            font-size: 12px;
-            color: #555;
-        }
-
-        .date-location {
-            font-size: 11px;
-            color: #777;
-            float: right;
-        }
-
-        .job-description {
-            font-size: 11px;
-            margin-top: 6px;
-        }
-
-        .job-description li {
-            margin-bottom: 3px;
-            margin-left: 18px;
-        }
-
-        .skills-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 15px;
-            font-size: 11px;
-        }
-
-        .skill-category {
-            margin-bottom: 10px;
-        }
-
-        .skill-category strong {
-            font-size: 11px;
-            display: block;
-            margin-bottom: 4px;
-        }
-
-        .clearfix::after {
-            content: "";
-            display: table;
-            clear: both;
-        }
-
-        @media print {
-            body {
-                background: white;
-                padding: 0;
-            }
-            
-            .resume {
-                box-shadow: none;
-                padding: 0.5in;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="resume">
-        <div class="header">
-            <div class="name">JOHN SMITH</div>
-            <div class="contact-info">
-                <span>📧 john.smith@email.com</span>
-                <span>📱 (555) 123-4567</span>
-                <span>🏠 New York, NY</span>
-                <span>💼 linkedin.com/in/johnsmith</span>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Professional Summary</div>
-            <p style="font-size: 11px; line-height: 1.4;">
-                Results-driven professional with 5+ years of experience in project management and business analysis. 
-                Proven track record of delivering projects on time and within budget while improving operational efficiency by 25%. 
-                Strong analytical skills with expertise in data analysis, process improvement, and cross-functional team leadership.
-            </p>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Professional Experience</div>
-            
-            <div class="job-entry clearfix">
-                <div class="job-title">Senior Project Manager</div>
-                <div class="date-location">Jan 2022 - Present</div>
-                <div class="company">ABC Corporation, New York, NY</div>
-                <ul class="job-description">
-                    <li>Led cross-functional teams of 8-12 members to deliver 15+ projects worth $2M+ annually</li>
-                    <li>Implemented agile methodologies resulting in 30% improvement in project delivery time</li>
-                    <li>Managed stakeholder relationships and communicated project status to C-level executives</li>
-                    <li>Reduced project costs by 15% through process optimization and vendor negotiations</li>
-                </ul>
-            </div>
-
-            <div class="job-entry clearfix">
-                <div class="job-title">Business Analyst</div>
-                <div class="date-location">Jun 2020 - Dec 2021</div>
-                <div class="company">XYZ Solutions, New York, NY</div>
-                <ul class="job-description">
-                    <li>Analyzed business processes and identified opportunities for improvement</li>
-                    <li>Created detailed requirements documentation and user stories for development teams</li>
-                    <li>Collaborated with IT and business units to implement system enhancements</li>
-                    <li>Conducted data analysis using SQL and Excel to support business decisions</li>
-                </ul>
-            </div>
-
-            <div class="job-entry clearfix">
-                <div class="job-title">Project Coordinator</div>
-                <div class="date-location">Aug 2019 - May 2020</div>
-                <div class="company">DEF Industries, New York, NY</div>
-                <ul class="job-description">
-                    <li>Coordinated project activities and maintained project schedules using MS Project</li>
-                    <li>Prepared status reports and presentations for senior management</li>
-                    <li>Facilitated team meetings and documented action items and decisions</li>
-                </ul>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Education</div>
-            <div class="education-entry clearfix">
-                <div class="job-title">Bachelor of Science in Business Administration</div>
-                <div class="date-location">2019</div>
-                <div class="company">University of New York, New York, NY</div>
-                <div style="font-size: 11px; margin-top: 2px;">Magna Cum Laude, GPA: 3.8/4.0</div>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Skills</div>
-            <div class="skills-grid">
-                <div>
-                    <div class="skill-category">
-                        <strong>Project Management:</strong>
-                        Agile, Scrum, Waterfall, MS Project, Jira, Risk Management
-                    </div>
-                    <div class="skill-category">
-                        <strong>Technical:</strong>
-                        SQL, Excel, Power BI, Tableau, Python, HTML/CSS
-                    </div>
-                </div>
-                <div>
-                    <div class="skill-category">
-                        <strong>Business Analysis:</strong>
-                        Requirements Gathering, Process Mapping, Gap Analysis, UAT
-                    </div>
-                    <div class="skill-category">
-                        <strong>Soft Skills:</strong>
-                        Leadership, Communication, Problem-Solving, Team Building
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Certifications</div>
-            <div style="font-size: 11px;">
-                <div style="margin-bottom: 4px;">• Project Management Professional (PMP) - Project Management Institute, 2023</div>
-                <div style="margin-bottom: 4px;">• Certified Scrum Master (CSM) - Scrum Alliance, 2022</div>
-                <div>• Google Data Analytics Professional Certificate - Google, 2021</div>
-            </div>
-        </div>
-    </div>
-</body>
-</html>
-"""
+    template_html = get_style_template(style)
 
     # 1. Run analysis
     analysis_prompt = f"""
@@ -1081,19 +85,11 @@ CV Content:
 
 Return ONLY the JSON object, no explanations or additional text.
 """
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "model": selected_model,
-        "messages": [{"role": "user", "content": analysis_prompt}],
-        "temperature": 0.3,
-        "max_tokens": 2000
-    }
-    response = requests.post(f"{OPENROUTER_BASE_URL}/chat/completions", headers=headers, json=data)
-    result = response.json()
-    analysis_content = result['choices'][0]['message']['content']
+    try:
+        analysis_content = chat_completion(
+            selected_model, analysis_prompt, temperature=0.3, max_tokens=2000)
+    except OpenRouterError as e:
+        return JSONResponse({'error': f'API request failed: {e}'}, status_code=500)
     try:
         analysis_json = pyjson.loads(analysis_content)
     except Exception:
@@ -1177,28 +173,8 @@ Generate the CV as a complete HTML document with:
         prompt += f"\n\nAdditional user instructions: {user_query}\n"
 
     try:
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        data = {
-            "model": selected_model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "temperature": 0.7,
-            "max_tokens": 4000
-        }
-        
-        response = requests.post(f"{OPENROUTER_BASE_URL}/chat/completions", headers=headers, json=data)
-        response.raise_for_status()
-        
-        result = response.json()
-        html_content = result['choices'][0]['message']['content']
+        html_content = chat_completion(
+            selected_model, prompt, temperature=0.7, max_tokens=4000)
         
         # Clean up the HTML content (remove any markdown formatting if present)
         if html_content.startswith('```html'):
@@ -1236,7 +212,7 @@ Generate the CV as a complete HTML document with:
         
         return JSONResponse(response_data)
         
-    except requests.exceptions.RequestException as e:
+    except OpenRouterError as e:
         return JSONResponse({'error': f'API request failed: {str(e)}'}, status_code=500)
     except Exception as e:
         return JSONResponse({'error': f'Optimization failed: {str(e)}'}, status_code=500)
@@ -1257,41 +233,13 @@ def generate_cover_letter(
     model: str = Form(None),
     tone: str = Form("professional")
 ):
-    # Process CV
-    cv_extracted_text = None
-    if cv_file:
-        if cv_file.filename.endswith('.pdf'):
-            pdf_reader = PdfReader(cv_file.file)
-            cv_extracted_text = " ".join(page.extract_text() or '' for page in pdf_reader.pages)
-        elif cv_file.filename.endswith('.docx'):
-            doc = Document(cv_file.file)
-            cv_extracted_text = " ".join([para.text for para in doc.paragraphs])
-        elif cv_file.filename.endswith('.txt'):
-            cv_extracted_text = cv_file.file.read().decode('utf-8')
-        else:
-            return JSONResponse({'error': 'Unsupported CV file type. Use PDF, DOCX, or TXT'}, status_code=400)
-    elif cv_text:
-        cv_extracted_text = cv_text
-    else:
-        return JSONResponse({'error': 'No CV provided (file or text)'}, status_code=400)
-    
-    # Process Job Description
-    job_desc_extracted_text = None
-    if job_desc_file:
-        if job_desc_file.filename.endswith('.pdf'):
-            pdf_reader = PdfReader(job_desc_file.file)
-            job_desc_extracted_text = " ".join(page.extract_text() or '' for page in pdf_reader.pages)
-        elif job_desc_file.filename.endswith('.docx'):
-            doc = Document(job_desc_file.file)
-            job_desc_extracted_text = " ".join([para.text for para in doc.paragraphs])
-        elif job_desc_file.filename.endswith('.txt'):
-            job_desc_extracted_text = job_desc_file.file.read().decode('utf-8')
-        else:
-            return JSONResponse({'error': 'Unsupported job description file type. Use PDF, DOCX, or TXT'}, status_code=400)
-    elif job_desc_text:
-        job_desc_extracted_text = job_desc_text
-    else:
-        return JSONResponse({'error': 'No job description provided (file or text)'}, status_code=400)
+    # Read the CV and job description from either an upload or raw text
+    try:
+        cv_extracted_text = extract_document_text(cv_file, cv_text, 'CV')
+        job_desc_extracted_text = extract_document_text(
+            job_desc_file, job_desc_text, 'job description')
+    except DocumentError as e:
+        return JSONResponse({'error': e.message}, status_code=e.status_code)
     
     # Get contact information with fallbacks
     contact_full_name = full_name
@@ -1310,9 +258,7 @@ def generate_cover_letter(
                 break
     
     # Use provided model or fall back to default
-    selected_model = DEFAULT_MODEL
-    if model and model in AVAILABLE_MODELS:
-        selected_model = AVAILABLE_MODELS[model]['id']
+    selected_model = resolve_model(model)
     
     from datetime import datetime
     current_date = datetime.now().strftime('%B %d, %Y')
@@ -1711,28 +657,8 @@ CV Content:
 """
     
     try:
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        data = {
-            "model": selected_model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "temperature": 0.8,
-            "max_tokens": 3000
-        }
-        
-        response = requests.post(f"{OPENROUTER_BASE_URL}/chat/completions", headers=headers, json=data)
-        response.raise_for_status()
-        
-        result = response.json()
-        html_content = result['choices'][0]['message']['content']
+        html_content = chat_completion(
+            selected_model, prompt, temperature=0.8, max_tokens=3000)
         
         # Clean up the HTML content
         if html_content.startswith('```html'):
@@ -1772,7 +698,7 @@ CV Content:
         
         return JSONResponse(response_data)
         
-    except requests.exceptions.RequestException as e:
+    except OpenRouterError as e:
         return JSONResponse({'error': f'API request failed: {str(e)}'}, status_code=500)
     except Exception as e:
         return JSONResponse({'error': f'Cover letter generation failed: {str(e)}'}, status_code=500)
@@ -1785,46 +711,16 @@ def analyze_cv(
     job_desc_text: Optional[str] = Form(None),
     model: str = Form(None)
 ):
-    # Process CV
-    cv_extracted_text = None
-    if cv_file:
-        if cv_file.filename.endswith('.pdf'):
-            pdf_reader = PdfReader(cv_file.file)
-            cv_extracted_text = " ".join(page.extract_text() or '' for page in pdf_reader.pages)
-        elif cv_file.filename.endswith('.docx'):
-            doc = Document(cv_file.file)
-            cv_extracted_text = " ".join([para.text for para in doc.paragraphs])
-        elif cv_file.filename.endswith('.txt'):
-            cv_extracted_text = cv_file.file.read().decode('utf-8')
-        else:
-            return JSONResponse({'error': 'Unsupported CV file type. Use PDF, DOCX, or TXT'}, status_code=400)
-    elif cv_text:
-        cv_extracted_text = cv_text
-    else:
-        return JSONResponse({'error': 'No CV provided (file or text)'}, status_code=400)
-    
-    # Process Job Description
-    job_desc_extracted_text = None
-    if job_desc_file:
-        if job_desc_file.filename.endswith('.pdf'):
-            pdf_reader = PdfReader(job_desc_file.file)
-            job_desc_extracted_text = " ".join(page.extract_text() or '' for page in pdf_reader.pages)
-        elif job_desc_file.filename.endswith('.docx'):
-            doc = Document(job_desc_file.file)
-            job_desc_extracted_text = " ".join([para.text for para in doc.paragraphs])
-        elif job_desc_file.filename.endswith('.txt'):
-            job_desc_extracted_text = job_desc_file.file.read().decode('utf-8')
-        else:
-            return JSONResponse({'error': 'Unsupported job description file type. Use PDF, DOCX, or TXT'}, status_code=400)
-    elif job_desc_text:
-        job_desc_extracted_text = job_desc_text
-    else:
-        return JSONResponse({'error': 'No job description provided (file or text)'}, status_code=400)
+    # Read the CV and job description from either an upload or raw text
+    try:
+        cv_extracted_text = extract_document_text(cv_file, cv_text, 'CV')
+        job_desc_extracted_text = extract_document_text(
+            job_desc_file, job_desc_text, 'job description')
+    except DocumentError as e:
+        return JSONResponse({'error': e.message}, status_code=e.status_code)
     
     # Use provided model or fall back to default
-    selected_model = DEFAULT_MODEL
-    if model and model in AVAILABLE_MODELS:
-        selected_model = AVAILABLE_MODELS[model]['id']
+    selected_model = resolve_model(model)
     
     # Create prompt for comprehensive CV analysis with JSON output
     prompt = f"""
@@ -1849,28 +745,8 @@ def analyze_cv(
     """
     
     try:
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        data = {
-            "model": selected_model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "temperature": 0.3,
-            "max_tokens": 2000
-        }
-        
-        response = requests.post(f"{OPENROUTER_BASE_URL}/chat/completions", headers=headers, json=data)
-        response.raise_for_status()
-        
-        result = response.json()
-        analysis_content = result['choices'][0]['message']['content']
+        analysis_content = chat_completion(
+            selected_model, prompt, temperature=0.3, max_tokens=2000)
         
         # Try to parse the JSON output
         try:
@@ -1890,7 +766,7 @@ def analyze_cv(
             'model_used': selected_model
         })
         
-    except requests.exceptions.RequestException as e:
+    except OpenRouterError as e:
         return JSONResponse({'error': f'API request failed: {str(e)}'}, status_code=500)
     except Exception as e:
         return JSONResponse({'error': f'Analysis failed: {str(e)}'}, status_code=500)
@@ -1903,14 +779,58 @@ def read_root():
 def get_docs():
     return {"message": "API documentation available at /docs endpoint"}
 
+@app.get('/health', response_class=JSONResponse)
+def health_check():
+    """Report service health and the state of its two external dependencies."""
+    checks = {
+        "openrouter": {
+            "configured": bool(OPENROUTER_API_KEY),
+            "base_url": OPENROUTER_BASE_URL
+        },
+        "gotenberg": {
+            "url": GOTENBERG_URL,
+            "reachable": False
+        }
+    }
+
+    # Gotenberg is optional, so a failure here degrades rather than fails.
+    try:
+        auth = None
+        if GOTENBERG_USERNAME and GOTENBERG_PASSWORD:
+            auth = (GOTENBERG_USERNAME, GOTENBERG_PASSWORD)
+        gotenberg_response = requests.get(f"{GOTENBERG_URL}/health", auth=auth, timeout=3)
+        checks['gotenberg']['reachable'] = gotenberg_response.status_code == 200
+    except Exception as e:
+        checks['gotenberg']['error'] = str(e)
+
+    # Without an API key no generation endpoint can work, so that alone is fatal.
+    if not checks['openrouter']['configured']:
+        status = "unhealthy"
+        status_code = 503
+    elif not checks['gotenberg']['reachable']:
+        status = "degraded"  # generation works, PDF conversion does not
+        status_code = 200
+    else:
+        status = "healthy"
+        status_code = 200
+
+    return JSONResponse({
+        "status": status,
+        "service": "cv-maker-api",
+        "default_model": DEFAULT_MODEL,
+        "available_models": len(AVAILABLE_MODELS),
+        "checks": checks
+    }, status_code=status_code)
+
 # Add a new endpoint to get available models
 @app.get("/available-models", response_class=JSONResponse)
 def get_available_models():
-    models = [
-        "gpt-4-turbo",
-        "claude-3-opus",
-        "llama-3",
-        "mixtral-8x7b"
-    ]
-    return {"models": models}
+    return {
+        "models": list(AVAILABLE_MODELS.keys()),
+        "default": next(
+            (key for key, m in AVAILABLE_MODELS.items() if m['id'] == DEFAULT_MODEL),
+            None
+        ),
+        "details": AVAILABLE_MODELS
+    }
  
