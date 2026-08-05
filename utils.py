@@ -2,7 +2,67 @@ import tempfile
 import os
 import requests
 from datetime import datetime
-from config import GOTENBERG_URL, GOTENBERG_USERNAME, GOTENBERG_PASSWORD
+from PyPDF2 import PdfReader
+from docx import Document
+from config import (
+    GOTENBERG_URL,
+    GOTENBERG_USERNAME,
+    GOTENBERG_PASSWORD,
+    MAX_UPLOAD_BYTES,
+)
+
+
+class DocumentError(Exception):
+    """Raised when an upload cannot be read. The message goes straight to the client."""
+
+    def __init__(self, message, status_code=400):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+def _check_size(upload_file, label):
+    """Reject oversized uploads before parsing them into memory."""
+    stream = upload_file.file
+    try:
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        stream.seek(0)
+    except (AttributeError, OSError):
+        return  # non-seekable stream; let the parser handle it
+    if size > MAX_UPLOAD_BYTES:
+        limit_mb = MAX_UPLOAD_BYTES // (1024 * 1024)
+        raise DocumentError(
+            f'{label} file is too large. Maximum size is {limit_mb}MB',
+            status_code=413
+        )
+
+
+def extract_document_text(upload_file, fallback_text, label):
+    """Return text from an upload, or the supplied text if no file was sent.
+
+    `label` is "CV" or "job description" and appears in error messages, which are
+    unchanged from when this logic was inlined in each endpoint.
+    """
+    if upload_file:
+        _check_size(upload_file, label)
+        filename = upload_file.filename or ''
+        if filename.endswith('.pdf'):
+            pdf_reader = PdfReader(upload_file.file)
+            return " ".join(page.extract_text() or '' for page in pdf_reader.pages)
+        elif filename.endswith('.docx'):
+            doc = Document(upload_file.file)
+            return " ".join([para.text for para in doc.paragraphs])
+        elif filename.endswith('.txt'):
+            return upload_file.file.read().decode('utf-8')
+        else:
+            raise DocumentError(
+                f'Unsupported {label} file type. Use PDF, DOCX, or TXT'
+            )
+    elif fallback_text:
+        return fallback_text
+    else:
+        raise DocumentError(f'No {label} provided (file or text)')
 
 def get_cv_html_template(style: str, content: str, title: str = "CV", custom_style: dict = None, custom_colors: dict = None) -> str:
     """Generate HTML with different CV styles and custom colors"""
