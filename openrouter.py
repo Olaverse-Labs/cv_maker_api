@@ -37,8 +37,13 @@ def _headers():
     return headers
 
 
-def chat_completion(model: str, prompt: str, temperature: float, max_tokens: int) -> str:
+def chat_completion(model: str, prompt: str, temperature: float, max_tokens: int,
+                    json_mode: bool = False) -> str:
     """Send one prompt to OpenRouter and return the message content.
+
+    With json_mode the provider is asked to guarantee a JSON object, which stops
+    models wrapping replies in a ```json fence. Not every model supports it, so
+    a rejection falls back to a plain call rather than failing the request.
 
     Raises OpenRouterError with a readable message on any failure.
     """
@@ -56,7 +61,22 @@ def chat_completion(model: str, prompt: str, temperature: float, max_tokens: int
         "temperature": temperature,
         "max_tokens": max_tokens
     }
+    if json_mode:
+        data["response_format"] = {"type": "json_object"}
 
+    try:
+        return _post(data, model)
+    except _UnsupportedResponseFormat:
+        logger.info("model=%s rejected response_format; retrying without it", model)
+        data.pop("response_format", None)
+        return _post(data, model)
+
+
+class _UnsupportedResponseFormat(Exception):
+    """The provider refused the JSON-mode parameter."""
+
+
+def _post(data, model):
     try:
         response = requests.post(
             f"{OPENROUTER_BASE_URL}/chat/completions",
@@ -73,6 +93,11 @@ def chat_completion(model: str, prompt: str, temperature: float, max_tokens: int
 
     if response.status_code != 200:
         detail = _error_detail(response)
+        # A 4xx naming response_format means this model has no JSON mode.
+        if (400 <= response.status_code < 500
+                and 'response_format' in data
+                and 'response_format' in detail.lower()):
+            raise _UnsupportedResponseFormat()
         logger.warning("openrouter http %s model=%s detail=%s",
                        response.status_code, model, detail)
         raise OpenRouterError(

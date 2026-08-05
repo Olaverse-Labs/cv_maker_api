@@ -70,6 +70,15 @@ Generate a professional cover letter.
 **Parameters:**
 - `generate_pdf` (default: false): Return PDF instead of JSON
 - `model` (optional): AI model to use
+- `tone` (default: `professional`): Tone of the letter
+- `full_name`, `email`, `phone`, `address`, `city_state_zip` (optional): Applicant contact details
+- `company_name` (optional): Company being applied to
+- `hiring_manager` (optional): Named recipient; falls back to "Hiring Manager"
+- `job_title` (optional): Role being applied for
+
+Supplying `company_name`, `hiring_manager` and `job_title` is strongly
+recommended — without them the model has to infer each one from the job
+description, which is where generic-sounding letters come from.
 
 #### `POST /analyze-cv`
 Analyze CV against job description.

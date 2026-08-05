@@ -8,8 +8,9 @@ from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL, AVAIL
 import tempfile
 import os
 from utils import convert_html_to_pdf, extract_document_text, DocumentError, parse_model_json
-from templates import get_style_template
+from templates import get_style_template, get_style_reference, get_style_class_names
 from openrouter import chat_completion, OpenRouterError
+from prompts import build_analysis_prompt, wrap_user_instructions
 import json as pyjson
 
 logging.basicConfig(
@@ -19,6 +20,23 @@ logging.basicConfig(
 logger = logging.getLogger("cv_maker_api")
 
 app = FastAPI(title="CV Maker API")
+
+# Registered before CORS so it ends up *inside* it: middleware added later wraps
+# what was added earlier. An @app.exception_handler(Exception) would not do, as
+# Starlette routes that to its outermost error middleware, which sits outside
+# CORS — the response would reach the browser with no CORS headers and surface as
+# an opaque "Failed to fetch" instead of the real error.
+@app.middleware("http")
+async def catch_unhandled_errors(request, call_next):
+    try:
+        return await call_next(request)
+    except Exception:
+        logger.exception("unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse(
+            {'error': 'An unexpected error occurred while processing the request'},
+            status_code=500
+        )
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,34 +79,16 @@ def optimize_cv(
     # Use provided model or fall back to default
     selected_model = resolve_model(model)
     
-    # Select template based on style
-    template_html = get_style_template(style)
+    # Style reference for the prompt: CSS only, no dummy CV content
+    style_css = get_style_reference(style)
+    style_classes = ', '.join(get_style_class_names(style))
 
     # 1. Run analysis
-    analysis_prompt = f"""
-You are an advanced CV analysis engine. Analyze the following CV against the provided job description and return a detailed JSON object with:
-- ats_score: score out of 100
-- keyword_match_percentage: percentage
-- missing_keywords: [list of missing keywords]
-- strengths: [list of strengths]
-- weaknesses: [list of weaknesses]
-- skills_gap: [list of missing skills]
-- formatting_issues: [list of formatting issues]
-- recommendations: [list of improvement recommendations]
-- overall_assessment: brief overall assessment
-
-Job Description:
-{job_desc_extracted_text}
-
-CV Content:
-{cv_extracted_text}
-
-Return ONLY the JSON object, no explanations or additional text.
-"""
+    analysis_prompt = build_analysis_prompt(cv_extracted_text, job_desc_extracted_text)
     try:
         analysis_content = chat_completion(
             selected_model, analysis_prompt, temperature=0.3,
-            max_tokens=ANALYSIS_MAX_TOKENS)
+            max_tokens=ANALYSIS_MAX_TOKENS, json_mode=True)
     except OpenRouterError as e:
         return JSONResponse({'error': f'API request failed: {e}'}, status_code=500)
 
@@ -116,9 +116,11 @@ Return ONLY the JSON object, no explanations or additional text.
 - ONLY include skills, experiences, and claims that are supported by the user's actual CV and the analysis below. Do NOT add anything the user cannot do.
 
 ## Styling and Output Requirements
-- Use the following CSS and HTML structure as a reference for layout and formatting. Do NOT copy any example content or dummy data from the template. Generate a new CV using the user's information below, following the style and layout of the template.
+- Reproduce the design defined by the CSS below. Use these class names so the CSS applies: {style_classes}
+- Reuse the CSS as given, adding only what you need for content you introduce.
 
-STYLE REFERENCE: {template_html}
+STYLE REFERENCE (CSS):
+{style_css}
 
 Job Description:
 {job_desc_extracted_text}
@@ -132,13 +134,15 @@ CV Analysis (for context):
 ## Core Requirements
 
 ### ATS Compatibility Rules
-- Use simple, readable fonts (Arial, Calibri, Times New Roman equivalents)
-- Avoid graphics, images, tables, or complex formatting
-- Use standard section headers that ATS systems recognize
-- Maintain single-column layout structure
+- Every piece of information must be real selectable text. Never place content in an image.
+- Do not use <table> elements to lay out content, and do not add graphics or icons that carry meaning.
+- Use standard section headers that ATS systems recognise (Experience, Education, Skills)
 - Use consistent bullet points and spacing
 - Include relevant keywords naturally within content
 - Ensure proper hierarchy with clear headings
+- The CSS above may use grid or multi-column rules for visual arrangement. That is
+  fine: keep the reading order of the underlying HTML linear and top-to-bottom, so
+  the document still parses correctly when the styling is stripped away.
 
 ### Standard CV Structure
 Generate CVs with these sections in order:
@@ -152,11 +156,13 @@ Generate CVs with these sections in order:
 
 
 ## Input Data
-- Name: {full_name}
-- Email: {email}
-- Phone: {phone}
-- Address: {address}
-- City/State/ZIP: {city_state_zip}
+Use only the contact details that are filled in. Omit any that are blank, and never
+write a placeholder or the word "None".
+- Name: {full_name or ''}
+- Email: {email or ''}
+- Phone: {phone or ''}
+- Address: {address or ''}
+- City/State/ZIP: {city_state_zip or ''}
 
 
 ## Output Format
@@ -168,12 +174,11 @@ Generate the CV as a complete HTML document with:
 - Clean, readable layout
 - Mobile-responsive structure
 - All content must be based on the user's data above
-- Do NOT copy any example content or dummy data from the style reference
+- Return the raw HTML document only. Do not wrap it in a markdown code fence and do not add commentary before or after it.
 """
     
-    # Add user_query to the prompt if provided
-    if user_query:
-        prompt += f"\n\nAdditional user instructions: {user_query}\n"
+    # Caller free-text, fenced so it reads as preference rather than instruction
+    prompt += wrap_user_instructions(user_query)
 
     try:
         html_content = chat_completion(
@@ -234,7 +239,11 @@ def generate_cover_letter(
     phone: Optional[str] = Form(None),
     generate_pdf: bool = Form(False),
     model: str = Form(None),
-    tone: str = Form("professional")
+    tone: str = Form("professional"),
+    # Personalisation. Supplying these beats having the model guess them.
+    company_name: Optional[str] = Form(None),
+    hiring_manager: Optional[str] = Form(None),
+    job_title: Optional[str] = Form(None)
 ):
     # Read the CV and job description from either an upload or raw text
     try:
@@ -306,9 +315,9 @@ Generate cover letters with these components:
 When generating a cover letter, use these parameters:
 - applicant_name: {contact_full_name or ''}
 - applicant_contact: {contact_email or ''}, {contact_phone or ''}, {contact_address or ''}, {contact_city_state_zip or ''}
-- job_title: [Extract from job description or CV if possible]
-- company_name: [Extract from job description or CV if possible]
-- hiring_manager: [If known, else use "Hiring Manager"]
+- job_title: {job_title or 'not supplied, infer it from the job description'}
+- company_name: {company_name or 'not supplied, infer it from the job description'}
+- hiring_manager: {hiring_manager or 'not supplied, address the letter to "Hiring Manager"'}
 - job_requirements: [Extracted from job description]
 - applicant_experience: [Extracted from CV]
 - company_research: [Extracted from job description or placeholder]
@@ -726,31 +735,12 @@ def analyze_cv(
     selected_model = resolve_model(model)
     
     # Create prompt for comprehensive CV analysis with JSON output
-    prompt = f"""
-    You are an advanced CV analysis engine. Analyze the following CV against the provided job description and return a detailed JSON object with:
-    - ats_score: score out of 100
-    - keyword_match_percentage: percentage
-    - missing_keywords: [list of missing keywords]
-    - strengths: [list of strengths]
-    - weaknesses: [list of weaknesses]
-    - skills_gap: [list of missing skills]
-    - formatting_issues: [list of formatting issues]
-    - recommendations: [list of improvement recommendations]
-    - overall_assessment: brief overall assessment
-    
-    Job Description:
-    {job_desc_extracted_text}
-    
-    CV Content:
-    {cv_extracted_text}
-    
-    Return ONLY the JSON object, no explanations or additional text.
-    """
+    prompt = build_analysis_prompt(cv_extracted_text, job_desc_extracted_text)
     
     try:
         analysis_content = chat_completion(
             selected_model, prompt, temperature=0.3,
-            max_tokens=ANALYSIS_MAX_TOKENS)
+            max_tokens=ANALYSIS_MAX_TOKENS, json_mode=True)
 
         # Here the analysis IS the deliverable, so an unparseable reply is an error
         # rather than something to continue past.
