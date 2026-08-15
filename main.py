@@ -1,15 +1,15 @@
 import logging
-from datetime import datetime
 from typing import Optional
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 import requests
-from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL, AVAILABLE_MODELS, resolve_model, GOTENBERG_URL, GOTENBERG_USERNAME, GOTENBERG_PASSWORD, CORS_ALLOW_ORIGINS, ANALYSIS_MAX_TOKENS
+from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL, AVAILABLE_MODELS, resolve_model, GOTENBERG_URL, GOTENBERG_USERNAME, GOTENBERG_PASSWORD, CORS_ALLOW_ORIGINS, ANALYSIS_MAX_TOKENS, DEFAULT_TIMEZONE
 import tempfile
 import os
 from utils import (convert_html_to_pdf, extract_document_text, DocumentError,
-                   parse_model_json, enforce_letter_date)
+                   parse_model_json, enforce_letter_date, today_in_timezone,
+                   infer_timezone)
 from templates import get_style_template, get_style_reference, get_style_class_names
 from openrouter import chat_completion, OpenRouterError
 from prompts import build_analysis_prompt, wrap_user_instructions
@@ -246,9 +246,11 @@ def generate_cover_letter(
     company_name: Optional[str] = Form(None),
     hiring_manager: Optional[str] = Form(None),
     job_title: Optional[str] = Form(None),
-    # Date printed in the letter head. Defaults to today on the server; pass a
-    # value to use the caller's own locale/timezone formatting instead.
-    letter_date: Optional[str] = Form(None)
+    # Date printed in the letter head. Defaults to today; pass a value to control
+    # the wording, or a `timezone` to keep the default correct for the applicant.
+    letter_date: Optional[str] = Form(None),
+    timezone: Optional[str] = Form(None),
+    request: Request = None
 ):
     # Read the CV and job description from either an upload or raw text
     try:
@@ -282,7 +284,17 @@ def generate_cover_letter(
     # Flattened and capped: this value lands in the prompt, so it must not be
     # able to carry extra instructions.
     supplied_date = ' '.join((letter_date or '').split())[:40]
-    current_date = supplied_date or datetime.now().strftime('%B %d, %Y')
+    # "Today" is not the same date everywhere at once, and the container runs
+    # UTC. An applicant in Auckland filing at 9am local would otherwise date the
+    # letter yesterday, so honour whatever zone the caller can tell us about.
+    zone, zone_source = infer_timezone(
+        request.headers if request else None, explicit=timezone)
+    if timezone and zone_source != 'request':
+        # Falling back silently would reproduce the very bug this guards against.
+        logger.warning("unresolvable timezone %r; inferred %s instead",
+                       timezone[:64], zone or DEFAULT_TIMEZONE)
+    current_date = supplied_date or today_in_timezone(zone, DEFAULT_TIMEZONE)
+    zone_used = None if supplied_date else (zone or DEFAULT_TIMEZONE)
 
     # Compose the new ATS-friendly cover letter prompt
     prompt = f"""
@@ -707,6 +719,8 @@ CV Content:
             'model_used': selected_model,
             'letter_date': current_date,
             'letter_date_enforced': bool(dates_rewritten),
+            'letter_timezone': zone_used,
+            'letter_timezone_source': None if supplied_date else zone_source,
             'contact_info_used': {
                 'full_name': contact_full_name,
                 'address': contact_address,

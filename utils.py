@@ -3,8 +3,10 @@ import re
 import tempfile
 import os
 import requests
+import pytz
 from html import escape
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from PyPDF2 import PdfReader
 from docx import Document
 from config import (
@@ -184,6 +186,164 @@ def extract_document_text(upload_file, fallback_text, label):
         return fallback_text
     else:
         raise DocumentError(f'No {label} provided (file or text)')
+
+# "+05:30", "-08:00", "+0530", "UTC+13", "GMT-5" — the shapes a browser or a
+# hand-written client is likely to send when it does not know its IANA name.
+_UTC_OFFSET_RE = re.compile(
+    r'^(?:UTC|GMT)?(?P<sign>[+-])(?P<hours>\d{1,2})(?::?(?P<minutes>\d{2}))?$',
+    re.IGNORECASE,
+)
+
+
+def resolve_timezone(name):
+    """Return a tzinfo for an IANA name or a UTC offset, or None if unusable.
+
+    Anything unrecognised returns None rather than raising: a mistyped timezone
+    should cost the caller a slightly wrong date, not a failed generation.
+    """
+    name = ' '.join((name or '').split())
+    if not name:
+        return None
+
+    offset = _UTC_OFFSET_RE.match(name)
+    if offset:
+        minutes = int(offset.group('hours')) * 60 + int(offset.group('minutes') or 0)
+        if minutes > 18 * 60:  # no real zone is further out than UTC+14
+            return None
+        if offset.group('sign') == '-':
+            minutes = -minutes
+        return timezone(timedelta(minutes=minutes))
+
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+
+
+# Headers that carry a timezone outright. Every major edge sets one of these, so
+# a deployment behind a CDN gets the applicant's zone without the client helping.
+_TIMEZONE_HEADERS = (
+    'x-timezone',                    # our own, if the frontend sets it
+    'x-vercel-ip-timezone',
+    'cloudfront-viewer-time-zone',
+    'cf-timezone',                   # Cloudflare, Enterprise plans
+)
+
+# Headers carrying an ISO country code, the next best thing.
+_COUNTRY_HEADERS = (
+    'cf-ipcountry',
+    'x-vercel-ip-country',
+    'cloudfront-viewer-country',
+    'x-appengine-country',
+    'x-country-code',
+)
+
+# Cloudflare's stand-ins for "no idea" and "Tor exit node".
+_UNKNOWN_COUNTRIES = {'XX', 'T1'}
+
+# pytz lists a country's zones in zone.tab order, which is not population order:
+# Australia comes out as Lord Howe Island and Brazil as Fernando de Noronha. For
+# countries wide enough for that to matter, name the zone most applicants live in.
+_COUNTRY_OVERRIDES = {
+    'AU': 'Australia/Sydney',
+    'BR': 'America/Sao_Paulo',
+    'CA': 'America/Toronto',
+    'CD': 'Africa/Kinshasa',
+    'CL': 'America/Santiago',
+    'EC': 'America/Guayaquil',
+    'ES': 'Europe/Madrid',
+    'ID': 'Asia/Jakarta',
+    'KZ': 'Asia/Almaty',
+    'MX': 'America/Mexico_City',
+    'MY': 'Asia/Kuala_Lumpur',
+    'PT': 'Europe/Lisbon',
+    'RU': 'Europe/Moscow',
+    'UA': 'Europe/Kyiv',
+    'US': 'America/New_York',
+    'ZA': 'Africa/Johannesburg',
+}
+
+
+def timezone_from_country(code):
+    """Best-effort zone for an ISO 3166-1 alpha-2 code, or None.
+
+    Most countries have exactly one zone, so this is exact for them. For the rest
+    it is an approximation, which still beats UTC: the date only differs from a
+    neighbouring zone's for the few hours either side of midnight.
+    """
+    code = (code or '').strip().upper()
+    if len(code) != 2 or code in _UNKNOWN_COUNTRIES:
+        return None
+    if code in _COUNTRY_OVERRIDES:
+        return _COUNTRY_OVERRIDES[code]
+    try:
+        zones = pytz.country_timezones(code)
+    except KeyError:
+        return None
+    return zones[0] if zones else None
+
+
+def timezone_from_accept_language(value):
+    """Zone implied by the region subtag of an Accept-Language header, or None.
+
+    "en-NG,en;q=0.9" means the browser is set to Nigerian English, which is a
+    weaker signal than an IP country — a Nigerian in London still sends it — but
+    it is the last thing available before falling back to a fixed default.
+    """
+    for tag in (value or '').split(','):
+        tag = tag.split(';')[0].strip()
+        parts = tag.replace('_', '-').split('-')
+        for part in parts[1:]:
+            if len(part) == 2 and part.isalpha():
+                zone = timezone_from_country(part)
+                if zone:
+                    return zone
+    return None
+
+
+def infer_timezone(headers=None, explicit=None):
+    """Work out the applicant's timezone from whatever the request reveals.
+
+    Returns (zone_name_or_None, source). Ordered most to least trustworthy: what
+    the caller stated, what the CDN observed, the country it observed, then the
+    browser's language region. None means nothing usable was found and the
+    configured default should stand.
+    """
+    if resolve_timezone(explicit):
+        return ' '.join(explicit.split()), 'request'
+
+    lookup = {}
+    if headers:
+        items = headers.items() if hasattr(headers, 'items') else headers
+        lookup = {str(k).lower(): v for k, v in items}
+
+    for header in _TIMEZONE_HEADERS:
+        if resolve_timezone(lookup.get(header)):
+            return ' '.join(lookup[header].split()), header
+
+    for header in _COUNTRY_HEADERS:
+        zone = timezone_from_country(lookup.get(header))
+        if zone:
+            return zone, header
+
+    zone = timezone_from_accept_language(lookup.get('accept-language'))
+    if zone:
+        return zone, 'accept-language'
+
+    return None, 'default'
+
+
+def today_in_timezone(name, fallback=None):
+    """Today's date where the applicant is, formatted for a letter head.
+
+    `name` wins, `fallback` (the configured default) is tried next, and UTC is
+    the last resort. The day is composed rather than strftime'd because the
+    padding-free directive for it differs between platforms.
+    """
+    tz = resolve_timezone(name) or resolve_timezone(fallback) or timezone.utc
+    today = datetime.now(tz)
+    return f"{today:%B} {today.day}, {today:%Y}"
+
 
 # An element carrying a class attribute, plus its contents up to its own closing
 # tag. The body rules out a nested open or close of the same tag, so the match

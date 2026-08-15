@@ -494,6 +494,107 @@ def test_cover_letter_date_can_be_overridden(client, stub_openrouter):
     assert '3 August 2026' in stub_openrouter[0]['payload']['messages'][0]['content']
 
 
+def test_cover_letter_date_follows_the_callers_timezone(client, stub_openrouter):
+    """UTC prints yesterday's date for applicants far enough east of it."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    for zone in ('Pacific/Auckland', 'Pacific/Honolulu'):
+        there = datetime.now(ZoneInfo(zone))
+        expected = f"{there:%B} {there.day}, {there:%Y}"
+        r = client.post('/generate-cover-letter', data={
+            'cv_text': CV, 'job_desc_text': JD, 'timezone': zone})
+        assert r.status_code == 200
+        assert r.json()['letter_date'] == expected
+        assert r.json()['letter_timezone'] == zone
+
+
+def test_cover_letter_timezone_can_come_from_a_header(client, stub_openrouter):
+    r = client.post('/generate-cover-letter',
+                    data={'cv_text': CV, 'job_desc_text': JD},
+                    headers={'X-Timezone': 'Pacific/Auckland'})
+    assert r.status_code == 200
+    assert r.json()['letter_timezone'] == 'Pacific/Auckland'
+
+
+@pytest.mark.parametrize('headers,expected,source', [
+    ({'X-Vercel-IP-Timezone': 'Asia/Kolkata'}, 'Asia/Kolkata', 'x-vercel-ip-timezone'),
+    ({'CloudFront-Viewer-Time-Zone': 'Asia/Tokyo'}, 'Asia/Tokyo', 'cloudfront-viewer-time-zone'),
+    ({'CF-IPCountry': 'NG'}, 'Africa/Lagos', 'cf-ipcountry'),
+    ({'CloudFront-Viewer-Country': 'AE'}, 'Asia/Dubai', 'cloudfront-viewer-country'),
+    ({'Accept-Language': 'en-NZ,en;q=0.9'}, 'Pacific/Auckland', 'accept-language'),
+    ({'CF-IPCountry': 'XX'}, 'UTC', 'default'),          # CDN says "unknown"
+    ({'Accept-Language': 'en'}, 'UTC', 'default'),        # no region subtag
+    ({}, 'UTC', 'default'),
+])
+def test_cover_letter_infers_timezone_from_the_request(client, stub_openrouter,
+                                                       headers, expected, source):
+    """Callers that tell us nothing still get a date, inferred from the edge."""
+    r = client.post('/generate-cover-letter',
+                    data={'cv_text': CV, 'job_desc_text': JD}, headers=headers)
+    assert r.status_code == 200
+    assert r.json()['letter_timezone'] == expected
+    assert r.json()['letter_timezone_source'] == source
+
+
+def test_explicit_timezone_outranks_the_cdn(client, stub_openrouter):
+    r = client.post('/generate-cover-letter',
+                    data={'cv_text': CV, 'job_desc_text': JD, 'timezone': 'Asia/Tokyo'},
+                    headers={'CF-IPCountry': 'NG'})
+    assert r.status_code == 200
+    assert r.json()['letter_timezone'] == 'Asia/Tokyo'
+    assert r.json()['letter_timezone_source'] == 'request'
+
+
+def test_bad_explicit_timezone_still_falls_through_to_inference(client, stub_openrouter):
+    """A broken client value should not throw away a good CDN signal."""
+    r = client.post('/generate-cover-letter',
+                    data={'cv_text': CV, 'job_desc_text': JD, 'timezone': 'Middle/Earth'},
+                    headers={'CF-IPCountry': 'NG'})
+    assert r.status_code == 200
+    assert r.json()['letter_timezone'] == 'Africa/Lagos'
+
+
+def test_country_timezone_picks_where_people_actually_live():
+    """pytz orders zones by zone.tab, which puts 12 people on Lord Howe first."""
+    from utils import timezone_from_country
+    assert timezone_from_country('AU') == 'Australia/Sydney'
+    assert timezone_from_country('BR') == 'America/Sao_Paulo'
+    assert timezone_from_country('US') == 'America/New_York'
+    assert timezone_from_country('NG') == 'Africa/Lagos'   # single-zone, exact
+    assert timezone_from_country('in') == 'Asia/Kolkata'   # case-insensitive
+    for junk in (None, '', 'XX', 'T1', 'ZZ', 'NGA', '12'):
+        assert timezone_from_country(junk) is None
+
+
+def test_cover_letter_accepts_utc_offsets(client, stub_openrouter):
+    """Clients that know their offset but not their IANA name still work."""
+    from datetime import datetime, timedelta, timezone as dt_timezone
+    there = datetime.now(dt_timezone(timedelta(hours=13)))
+    r = client.post('/generate-cover-letter', data={
+        'cv_text': CV, 'job_desc_text': JD, 'timezone': '+13:00'})
+    assert r.status_code == 200
+    assert r.json()['letter_date'] == f"{there:%B} {there.day}, {there:%Y}"
+
+
+def test_cover_letter_bad_timezone_falls_back_instead_of_failing(client, stub_openrouter):
+    r = client.post('/generate-cover-letter', data={
+        'cv_text': CV, 'job_desc_text': JD, 'timezone': 'Middle/Earth'})
+    assert r.status_code == 200
+    assert r.json()['letter_timezone'] == 'UTC'  # reported, not silently pretended
+
+
+def test_resolve_timezone_handles_the_shapes_clients_send():
+    from datetime import timedelta
+    from utils import resolve_timezone
+    assert resolve_timezone('Europe/London') is not None
+    assert resolve_timezone('+05:30').utcoffset(None) == timedelta(hours=5, minutes=30)
+    assert resolve_timezone('-0800').utcoffset(None) == timedelta(hours=-8)
+    assert resolve_timezone('UTC+13').utcoffset(None) == timedelta(hours=13)
+    assert resolve_timezone('  Asia/Tokyo  ') is not None
+    for junk in (None, '', 'Middle/Earth', '+99:00', 'DROP TABLE'):
+        assert resolve_timezone(junk) is None
+
+
 def test_cover_letter_date_element_is_overwritten(client, stub_openrouter, monkeypatch):
     """The prompt makes the right date likely; this makes it certain."""
     import main

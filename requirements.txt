@@ -6,5 +6,10 @@ python-dotenv==1.0.1
 requests==2.31.0
 PyPDF2==3.0.1
 python-docx==1.1.0
+# zoneinfo reads the OS timezone database, which slim base images may ship
+# without; this is the fallback copy it falls back to.
+tzdata==2024.1
+# Only for its country-to-timezone table, which the stdlib does not expose.
+pytz==2024.1
 
 # Add any other dependencies your app uses below

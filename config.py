@@ -24,6 +24,11 @@ APP_TITLE = os.getenv("APP_TITLE", "CV Maker API")
 # read straight into memory.
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "10")) * 1024 * 1024
 
+# Timezone the cover letter date falls back to when the caller names none. The
+# container clock is UTC, which prints yesterday's date for applicants far enough
+# east of it, so a service with a known audience should set this to their zone.
+DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "UTC")
+
 # Comma-separated list of allowed CORS origins, or "*" for any.
 CORS_ALLOW_ORIGINS = [
     o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()

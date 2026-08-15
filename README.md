@@ -76,14 +76,48 @@ Generate a professional cover letter.
 - `hiring_manager` (optional): Named recipient; falls back to "Hiring Manager"
 - `job_title` (optional): Role being applied for
 - `letter_date` (optional): Date printed in the letter head, used verbatim.
-  Defaults to the server's current date (`August 15, 2026` format). Pass a value
-  to control the format or to use the caller's timezone rather than the server's.
+  Overrides `timezone`. Use it to control the wording, e.g. `15 August 2026`.
+- `timezone` (optional): IANA name (`Pacific/Auckland`) or UTC offset (`+13:00`,
+  `-0800`, `UTC+13`) the default date is computed in. May also be sent as an
+  `X-Timezone` header, which is usually one line in a shared HTTP client.
+
+##### How the date gets its timezone
+
+"Today" is not the same date everywhere at once and the container clock is UTC,
+so an applicant in Auckland filing at 9am local would otherwise date the letter
+yesterday. Nothing has to be passed for this to work: the zone is resolved from
+the request itself, most to least trustworthy, and the first hit wins.
+
+| # | Source | Accuracy |
+| --- | --- | --- |
+| 1 | `timezone` form field | Exact |
+| 2 | `X-Timezone` header | Exact |
+| 3 | CDN timezone headers — `X-Vercel-IP-Timezone`, `CloudFront-Viewer-Time-Zone`, `CF-Timezone` | Exact, set by the edge from the viewer's IP |
+| 4 | CDN country headers — `CF-IPCountry`, `X-Vercel-IP-Country`, `CloudFront-Viewer-Country`, `X-Appengine-Country` | Exact for single-zone countries, approximate for wide ones |
+| 5 | `Accept-Language` region subtag (`en-NZ` → New Zealand) | Weak: a Nigerian in London still sends `en-NG` |
+| 6 | `DEFAULT_TIMEZONE`, else UTC | Fixed |
+
+Rows 3–5 need no client changes at all — a deployment behind Cloudflare,
+Vercel, CloudFront or App Engine already gets them. Row 3 is the one to aim for;
+enable your CDN's geolocation headers and worldwide accuracy comes free. Failing
+that, browsers know their own zone, so `Intl.DateTimeFormat().resolvedOptions().timeZone`
+sent as `X-Timezone` gets you row 2 in one line.
+
+Where a country spans many zones the most populous one is used (`US` →
+`America/New_York`, `AU` → `Australia/Sydney`), which is approximate: it is only
+ever wrong by a day, and only for applicants in another zone of that country
+within a few hours of midnight. An unresolvable value falls through to the next
+source rather than failing the request.
 
 Supplying `company_name`, `hiring_manager` and `job_title` is strongly
 recommended — without them the model has to infer each one from the job
 description, which is where generic-sounding letters come from.
 
-The JSON response echoes the date used as `letter_date`. The date is pinned in
+The JSON response echoes the date used as `letter_date`, the zone it was computed
+in as `letter_timezone`, and which of the sources above supplied it as
+`letter_timezone_source` (both `null` when `letter_date` was passed). Watching
+how often `letter_timezone_source` comes back `default` tells you what share of
+real traffic is falling all the way through. The date is pinned in
 the prompt *and* the returned HTML's `class="date"` element is rewritten
 afterwards, so the printed date does not depend on the model getting it right;
 `letter_date_enforced` reports whether that rewrite found an element to act on.
@@ -239,6 +273,8 @@ This will test:
 - `MAX_UPLOAD_MB`: Largest accepted upload per file (default `10`)
 - `CORS_ALLOW_ORIGINS`: Comma-separated origins, or `*` for any (default `*`)
 - `APP_URL` / `APP_TITLE`: Optional OpenRouter dashboard attribution
+- `DEFAULT_TIMEZONE`: Zone the cover letter date falls back to when the caller
+  names none (default `UTC`). Set it to your audience's zone if they share one
 - `LOG_LEVEL`: Logging level (default `INFO`)
 
 ### Running the tests
