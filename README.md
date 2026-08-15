@@ -75,10 +75,15 @@ Generate a professional cover letter.
 - `company_name` (optional): Company being applied to
 - `hiring_manager` (optional): Named recipient; falls back to "Hiring Manager"
 - `job_title` (optional): Role being applied for
+- `letter_date` (optional): Date printed in the letter head, used verbatim.
+  Defaults to the server's current date (`August 15, 2026` format). Pass a value
+  to control the format or to use the caller's timezone rather than the server's.
 
 Supplying `company_name`, `hiring_manager` and `job_title` is strongly
 recommended — without them the model has to infer each one from the job
 description, which is where generic-sounding letters come from.
+
+The JSON response echoes the date used as `letter_date`.
 
 #### `POST /analyze-cv`
 Analyze CV against job description.
