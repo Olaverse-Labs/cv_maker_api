@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -243,7 +244,10 @@ def generate_cover_letter(
     # Personalisation. Supplying these beats having the model guess them.
     company_name: Optional[str] = Form(None),
     hiring_manager: Optional[str] = Form(None),
-    job_title: Optional[str] = Form(None)
+    job_title: Optional[str] = Form(None),
+    # Date printed in the letter head. Defaults to today on the server; pass a
+    # value to use the caller's own locale/timezone formatting instead.
+    letter_date: Optional[str] = Form(None)
 ):
     # Read the CV and job description from either an upload or raw text
     try:
@@ -272,9 +276,13 @@ def generate_cover_letter(
     # Use provided model or fall back to default
     selected_model = resolve_model(model)
     
-    from datetime import datetime
-    current_date = datetime.now().strftime('%B %d, %Y')
-    
+    # The model has no notion of "today", so without a date handed to it
+    # explicitly it invents one from its training data. Pin it here.
+    # Flattened and capped: this value lands in the prompt, so it must not be
+    # able to carry extra instructions.
+    supplied_date = ' '.join((letter_date or '').split())[:40]
+    current_date = supplied_date or datetime.now().strftime('%B %d, %Y')
+
     # Compose the new ATS-friendly cover letter prompt
     prompt = f"""
 # ATS-Friendly Cover Letter Generation Prompt
@@ -297,6 +305,9 @@ You are a professional cover letter generator that creates compelling, ATS-frien
 ### Standard Cover Letter Structure
 Generate cover letters with these components:
 1. **Header** (Applicant contact info, date, recipient info)
+   - The date line must be exactly `{current_date}` — reproduce it verbatim.
+     Never invent, infer, or reformat a date, and never take one from the CV or
+     job description.
 2. **Salutation** (Personalized greeting when possible)
 3. **Opening Paragraph** (Position, value proposition, hook)
 4. **Body Paragraphs** (Experience, achievements, company fit)
@@ -318,6 +329,7 @@ When generating a cover letter, use these parameters:
 - job_title: {job_title or 'not supplied, infer it from the job description'}
 - company_name: {company_name or 'not supplied, infer it from the job description'}
 - hiring_manager: {hiring_manager or 'not supplied, address the letter to "Hiring Manager"'}
+- letter_date: {current_date}
 - job_requirements: [Extracted from job description]
 - applicant_experience: [Extracted from CV]
 - company_research: [Extracted from job description or placeholder]
@@ -537,7 +549,7 @@ Use the following example as a reference for structure, style, and best practice
                     </div>
                 </div>
                 
-                <div class=\"date\">July 14, 2025</div>
+                <div class=\"date\">{current_date}</div>
                 
                 <div class=\"recipient-info\">
                     <div><strong>Ms. Jennifer Chen</strong></div>
@@ -666,6 +678,7 @@ CV Content:
 ## Output Requirements
 - Return ONLY the complete HTML document, no explanations or additional text.
 - The entire cover letter must fit on a single A4 page. Trim or summarize content as needed to ensure it does not overflow to a second page.
+- The header date must read exactly `{current_date}`, and that date must appear nowhere else in the letter.
 """
     
     try:
@@ -683,6 +696,7 @@ CV Content:
             'message': 'Cover letter generated successfully',
             'html_content': html_content,
             'model_used': selected_model,
+            'letter_date': current_date,
             'contact_info_used': {
                 'full_name': contact_full_name,
                 'address': contact_address,
