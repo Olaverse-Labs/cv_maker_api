@@ -83,7 +83,10 @@ Supplying `company_name`, `hiring_manager` and `job_title` is strongly
 recommended — without them the model has to infer each one from the job
 description, which is where generic-sounding letters come from.
 
-The JSON response echoes the date used as `letter_date`.
+The JSON response echoes the date used as `letter_date`. The date is pinned in
+the prompt *and* the returned HTML's `class="date"` element is rewritten
+afterwards, so the printed date does not depend on the model getting it right;
+`letter_date_enforced` reports whether that rewrite found an element to act on.
 
 #### `POST /analyze-cv`
 Analyze CV against job description.

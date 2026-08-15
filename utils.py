@@ -1,7 +1,9 @@
 import json
+import re
 import tempfile
 import os
 import requests
+from html import escape
 from datetime import datetime
 from PyPDF2 import PdfReader
 from docx import Document
@@ -182,6 +184,47 @@ def extract_document_text(upload_file, fallback_text, label):
         return fallback_text
     else:
         raise DocumentError(f'No {label} provided (file or text)')
+
+# An element carrying a class attribute, plus its contents up to its own closing
+# tag. The body rules out a nested open or close of the same tag, so the match
+# stays on the innermost element rather than swallowing a sibling's markup.
+_CLASSED_ELEMENT_RE = re.compile(
+    r'(?P<open><(?P<tag>[a-zA-Z][\w:-]*)\b[^>]*?'
+    r'class\s*=\s*(?P<q>["\'])(?P<cls>[^"\']*)(?P=q)[^>]*>)'
+    r'(?P<body>(?:(?!</?(?P=tag)\b).)*?)'
+    r'(?P<close></(?P=tag)\s*>)',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def enforce_letter_date(html_content: str, date_text: str):
+    """Overwrite the letter's date element with `date_text`.
+
+    The prompt pins the date too, but that only makes the right answer likely —
+    the model still owns the output. Rewriting it here makes it certain, which
+    matters because a wrong date on a cover letter is the kind of error a
+    recruiter notices and the applicant never sees.
+
+    Returns (html, replacements). Zero replacements means the model laid the
+    header out without a `class="date"` element and the text is left untouched;
+    there is no way to tell a date apart from the rest of the prose without
+    guessing, and a bad guess would corrupt the letter.
+    """
+    if not html_content or not date_text:
+        return html_content, 0
+
+    replaced = 0
+
+    def rewrite(match):
+        nonlocal replaced
+        # Exact class token, so `date-location` and `update` are left alone.
+        if 'date' not in match.group('cls').split():
+            return match.group(0)
+        replaced += 1
+        return match.group('open') + escape(date_text) + match.group('close')
+
+    return _CLASSED_ELEMENT_RE.sub(rewrite, html_content), replaced
+
 
 def get_cv_html_template(style: str, content: str, title: str = "CV", custom_style: dict = None, custom_colors: dict = None) -> str:
     """Generate HTML with different CV styles and custom colors"""

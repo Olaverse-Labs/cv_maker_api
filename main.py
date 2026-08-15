@@ -8,7 +8,8 @@ import requests
 from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL, AVAILABLE_MODELS, resolve_model, GOTENBERG_URL, GOTENBERG_USERNAME, GOTENBERG_PASSWORD, CORS_ALLOW_ORIGINS, ANALYSIS_MAX_TOKENS
 import tempfile
 import os
-from utils import convert_html_to_pdf, extract_document_text, DocumentError, parse_model_json
+from utils import (convert_html_to_pdf, extract_document_text, DocumentError,
+                   parse_model_json, enforce_letter_date)
 from templates import get_style_template, get_style_reference, get_style_class_names
 from openrouter import chat_completion, OpenRouterError
 from prompts import build_analysis_prompt, wrap_user_instructions
@@ -691,12 +692,21 @@ CV Content:
         if html_content.endswith('```'):
             html_content = html_content[:-3]
         html_content = html_content.strip()
-        
+
+        # Belt and braces over the pinned date in the prompt: the model still
+        # owns its output, so overwrite the date element rather than trust it.
+        html_content, dates_rewritten = enforce_letter_date(html_content, current_date)
+        if not dates_rewritten:
+            logger.warning(
+                "cover letter has no class=\"date\" element to pin model=%s",
+                selected_model)
+
         response_data = {
             'message': 'Cover letter generated successfully',
             'html_content': html_content,
             'model_used': selected_model,
             'letter_date': current_date,
+            'letter_date_enforced': bool(dates_rewritten),
             'contact_info_used': {
                 'full_name': contact_full_name,
                 'address': contact_address,
