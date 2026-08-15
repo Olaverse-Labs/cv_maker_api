@@ -494,6 +494,52 @@ def test_cover_letter_date_can_be_overridden(client, stub_openrouter):
     assert '3 August 2026' in stub_openrouter[0]['payload']['messages'][0]['content']
 
 
+def test_cover_letter_date_element_is_overwritten(client, stub_openrouter, monkeypatch):
+    """The prompt makes the right date likely; this makes it certain."""
+    import main
+    monkeypatch.setattr(main, 'chat_completion', lambda *a, **k: (
+        '<html><body><div class="date">March 2025</div>'
+        '<div class="salutation">Dear Hiring Manager,</div></body></html>'))
+    r = client.post('/generate-cover-letter', data={
+        'cv_text': CV, 'job_desc_text': JD, 'letter_date': '15 August 2026'})
+    assert r.status_code == 200
+    body = r.json()
+    assert '<div class="date">15 August 2026</div>' in body['html_content']
+    assert 'March 2025' not in body['html_content']
+    assert body['letter_date_enforced'] is True
+
+
+def test_cover_letter_without_date_element_is_left_intact(client, stub_openrouter, monkeypatch):
+    import main
+    original = '<html><body><p>Dear Hiring Manager,</p></body></html>'
+    monkeypatch.setattr(main, 'chat_completion', lambda *a, **k: original)
+    r = client.post('/generate-cover-letter', data={'cv_text': CV, 'job_desc_text': JD})
+    assert r.status_code == 200
+    assert r.json()['html_content'] == original
+    assert r.json()['letter_date_enforced'] is False
+
+
+def test_enforce_letter_date_leaves_similar_classes_alone():
+    from utils import enforce_letter_date
+    html = ('<div class="date-location">2019 - 2021</div>'
+            '<div class="header date wide">old</div>'
+            "<span class='update'>keep</span>")
+    out, count = enforce_letter_date(html, 'May 1, 2026')
+    assert count == 1
+    assert '<div class="date-location">2019 - 2021</div>' in out
+    assert '<div class="header date wide">May 1, 2026</div>' in out
+    assert "<span class='update'>keep</span>" in out
+
+
+def test_enforce_letter_date_escapes_and_survives_nesting():
+    from utils import enforce_letter_date
+    html = '<div class="header"><div class="date">March 2025</div><b>x</b></div>'
+    out, count = enforce_letter_date(html, 'Smith & Co <b>')
+    assert count == 1
+    assert '<b>x</b></div>' in out            # sibling markup untouched
+    assert 'Smith &amp; Co &lt;b&gt;' in out  # date text escaped, not injected
+
+
 def test_cover_letter_date_cannot_smuggle_instructions(client, stub_openrouter):
     r = client.post('/generate-cover-letter', data={
         'cv_text': CV, 'job_desc_text': JD,
