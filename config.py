@@ -129,6 +129,12 @@ LEGACY_MODEL_ALIASES = {
 }
 
 
+# Ceiling for a generation call when the model is not one we list. Generous on
+# purpose: max_tokens is a cap, not a spend, and a CV cut off mid-tag is a far
+# worse outcome than an unused allowance.
+FALLBACK_MAX_TOKENS = 8000
+
+
 def resolve_model(model_key):
     """Return the OpenRouter model ID for a client-supplied key, or the default."""
     if not model_key:
@@ -139,7 +145,23 @@ def resolve_model(model_key):
     return DEFAULT_MODEL
 
 
+def model_max_tokens(model_id):
+    """Output cap for a model ID, from the table that /available-models serves.
+
+    The per-model `max_tokens` used to be advertised to clients and then ignored
+    at the call site, which is how CV generation ended up hardcoded at 4000 —
+    low enough to cut a long CV off mid-tag.
+    """
+    for model in AVAILABLE_MODELS.values():
+        if model['id'] == model_id:
+            return model['max_tokens']
+    return FALLBACK_MAX_TOKENS
+
+
 # Gotenberg PDF generation settings
 GOTENBERG_URL = os.getenv("GOTENBERG_URL", "http://localhost:3000")
+# Seconds to wait on a conversion. Same reasoning as OPENROUTER_TIMEOUT: without
+# one, a hung Gotenberg holds a worker thread for the life of the process.
+GOTENBERG_TIMEOUT = int(os.getenv("GOTENBERG_TIMEOUT", "60"))
 GOTENBERG_USERNAME = os.getenv("GOTENBERG_USERNAME", "")
 GOTENBERG_PASSWORD = os.getenv("GOTENBERG_PASSWORD", "")

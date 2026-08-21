@@ -55,7 +55,9 @@ raw text:
 - `job_desc_file` / `job_desc_text` — same, for the job description
 
 Files are capped at `MAX_UPLOAD_MB` (10MB by default); a larger one returns
-`413`. A missing document returns `400`.
+`413`. A missing document returns `400`, as does one that yields no text —
+an empty file, or a PDF that is a scan rather than text. Extensions are matched
+case-insensitively, so `CV.PDF` is accepted.
 
 #### `POST /optimize-cv`
 Generate an optimized, ATS-friendly resume.
@@ -63,6 +65,26 @@ Generate an optimized, ATS-friendly resume.
 **Parameters:**
 - `generate_pdf` (default: false): Return PDF instead of JSON
 - `model` (optional): AI model to use
+- `style` (default: `classic`): `classic`, `modern` (alias `minimal`) or `creative`
+- `full_name`, `email`, `phone`, `address`, `city_state_zip` (optional): Applicant contact details
+- `user_query` (optional): Free-text preference passed on to the model
+
+##### How contact details stay the applicant's own
+
+The prompt tells the model to rewrite rather than copy the source CV, and the
+header used to get caught by that: a supplied phone number came back as a stock
+`0123456789`. Contact details are now excluded from the rewrite rule in the
+prompt *and* the returned HTML's `class="contact-info"` element is corrected
+afterwards, so a `phone` or `email` that was passed in is what gets printed —
+replacing whatever the model wrote, or appended if it wrote none.
+
+Only those two are enforced: an address or a city has no shape to recognise in
+markup, and stays the prompt's job. A detail that was *not* passed in is left
+alone rather than deleted on suspicion, since the only evidence against it is
+text extracted from a PDF. The JSON response reports what happened per field in
+`contact_enforced` — `corrected`, `added` or `unchanged`; a supplied field
+missing from that map means the model produced no `contact-info` element to act
+on, which is also logged.
 
 #### `POST /generate-cover-letter`
 Generate a professional cover letter.
@@ -121,6 +143,20 @@ real traffic is falling all the way through. The date is pinned in
 the prompt *and* the returned HTML's `class="date"` element is rewritten
 afterwards, so the printed date does not depend on the model getting it right;
 `letter_date_enforced` reports whether that rewrite found an element to act on.
+
+The letterhead's `email` and `phone` are pinned the same way and reported in
+`contact_enforced` — see the `/optimize-cv` section above. The example letter
+inside the prompt carries a sample name and phone number for layout, and a model
+rewriting rather than copying will otherwise reach for them.
+
+##### Replies that run out of tokens
+
+Generation is capped at the model's advertised `max_tokens` (see
+`GET /available-models`). A reply that hits the cap is a document cut off
+mid-tag, so both generation endpoints report it as `truncated: true` rather than
+as a success, and decline to convert it to a PDF — a partial PDF looks finished,
+which is the worst of the available outcomes. Retry or pick a model with a
+larger output limit.
 
 #### `POST /analyze-cv`
 Analyze CV against job description.
@@ -238,27 +274,16 @@ curl -X POST "http://localhost:8000/optimize-cv" \
 {
   "message": "CV optimized successfully",
   "html_content": "<!DOCTYPE html>...",
-  "model_used": "anthropic/claude-sonnet-5"
+  "model_used": "anthropic/claude-sonnet-5",
+  "contact_enforced": {"phone": "corrected"},
+  "truncated": false
 }
 ```
 
 ### PDF Response
-When `generate_pdf=true`, returns a PDF file directly.
-
-## Testing
-
-Run the test script to verify all functionality:
-
-```bash
-python test_api.py
-```
-
-This will test:
-- CV optimization
-- Cover letter generation
-- CV analysis
-- PDF generation
-- All API endpoints
+When `generate_pdf=true`, returns a PDF file directly. If the conversion fails,
+or the reply was truncated, the JSON body is returned instead with the reason in
+`pdf_error`.
 
 ## Configuration
 
@@ -269,6 +294,7 @@ This will test:
 - `GOTENBERG_USERNAME`: Gotenberg username (optional)
 - `GOTENBERG_PASSWORD`: Gotenberg password (optional)
 - `OPENROUTER_TIMEOUT`: Seconds to wait for a model response (default `120`)
+- `GOTENBERG_TIMEOUT`: Seconds to wait for a PDF conversion (default `60`)
 - `ANALYSIS_MAX_TOKENS`: Token ceiling for the analysis step (default `6000`)
 - `MAX_UPLOAD_MB`: Largest accepted upload per file (default `10`)
 - `CORS_ALLOW_ORIGINS`: Comma-separated origins, or `*` for any (default `*`)

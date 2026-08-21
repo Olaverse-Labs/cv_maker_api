@@ -1,20 +1,24 @@
 import json
+import logging
 import re
 import tempfile
 import os
 import requests
 import pytz
-from html import escape
+from html import escape, unescape
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from PyPDF2 import PdfReader
 from docx import Document
 from config import (
     GOTENBERG_URL,
+    GOTENBERG_TIMEOUT,
     GOTENBERG_USERNAME,
     GOTENBERG_PASSWORD,
     MAX_UPLOAD_BYTES,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _strip_code_fence(text):
@@ -166,23 +170,39 @@ def extract_document_text(upload_file, fallback_text, label):
 
     `label` is "CV" or "job description" and appears in error messages, which are
     unchanged from when this logic was inlined in each endpoint.
+
+    Whatever the source, the result has to contain something. Empty input used to
+    be passed on to the model, which answered by inventing a whole CV — two paid
+    calls to produce a document about nobody.
     """
     if upload_file:
         _check_size(upload_file, label)
         filename = upload_file.filename or ''
-        if filename.endswith('.pdf'):
+        # Case-folded: phones and Windows both hand over "CV.PDF" routinely, and
+        # a straight endswith rejected those as an unsupported type.
+        extension = os.path.splitext(filename)[1].lower()
+        if extension == '.pdf':
             pdf_reader = PdfReader(upload_file.file)
-            return " ".join(page.extract_text() or '' for page in pdf_reader.pages)
-        elif filename.endswith('.docx'):
+            text = " ".join(page.extract_text() or '' for page in pdf_reader.pages)
+            if not text.strip():
+                raise DocumentError(
+                    f'No text could be read from the {label} PDF. If it is a scan '
+                    f'or an image, send a text-based PDF, DOCX or TXT instead'
+                )
+            return text
+        elif extension == '.docx':
             doc = Document(upload_file.file)
-            return " ".join([para.text for para in doc.paragraphs])
-        elif filename.endswith('.txt'):
-            return upload_file.file.read().decode('utf-8')
+            text = " ".join([para.text for para in doc.paragraphs])
+        elif extension == '.txt':
+            text = upload_file.file.read().decode('utf-8', errors='replace')
         else:
             raise DocumentError(
                 f'Unsupported {label} file type. Use PDF, DOCX, or TXT'
             )
-    elif fallback_text:
+        if not text.strip():
+            raise DocumentError(f'The {label} file is empty')
+        return text
+    elif fallback_text and fallback_text.strip():
         return fallback_text
     else:
         raise DocumentError(f'No {label} provided (file or text)')
@@ -386,313 +406,231 @@ def enforce_letter_date(html_content: str, date_text: str):
     return _CLASSED_ELEMENT_RE.sub(rewrite, html_content), replaced
 
 
-def get_cv_html_template(style: str, content: str, title: str = "CV", custom_style: dict = None, custom_colors: dict = None) -> str:
-    """Generate HTML with different CV styles and custom colors"""
-    
-    # Use custom preferences if provided, otherwise use defaults
-    if custom_style:
-        font_size = custom_style.get('font_size', '12px')
-        line_spacing = custom_style.get('line_spacing', '1.5')
-    else:
-        font_size = '12px'
-        line_spacing = '1.5'
-    
-    if custom_colors:
-        primary_color = custom_colors.get('primary', '#2c3e50')
-        secondary_color = custom_colors.get('secondary', '#3498db')
-        accent_color = custom_colors.get('accent', '#34495e')
-    else:
-        primary_color = '#2c3e50'
-        secondary_color = '#3498db'
-        accent_color = '#34495e'
-    
-    # Base CSS for all styles
-    base_css = f"""
-        @page {{ margin: 0; }}
-        body {{ 
-            font-family: Arial, sans-serif; 
-            line-height: {line_spacing}; 
-            margin: 0; 
-            padding: 0; 
-            color: #333; 
-            font-size: {font_size};
-        }}
-        h1 {{ margin: 0 0 20px 0; }}
-        h2 {{ margin: 30px 0 15px 0; }}
-        h3 {{ margin: 20px 0 10px 0; }}
-        ul {{ margin: 10px 0 10px 20px; }}
-        li {{ margin-bottom: 5px; }}
-        .header {{ text-align: center; margin-bottom: 30px; }}
-        .content {{ 
-            white-space: pre-wrap; 
-            font-size: {font_size}; 
-            line-height: {line_spacing};
-        }}
-        p {{ margin: 0 0 12px 0; }}
+# Contact details as they appear in generated markup. An address or a city line
+# has no shape to match on, so only these two are machine-checkable — the rest
+# stay the prompt's job.
+_EMAIL_RE = re.compile(r'[\w.+%-]+@[\w-]+(?:\.[\w-]+)+')
+# A phone number as people write them, brackets and country code included. The
+# separator class is deliberately narrow, and the digit count is checked after
+# matching, so a year range or a street number does not pass for a number.
+_PHONE_RE = re.compile(r'[+(]?\d[\d\s().+/–—-]{5,20}\d')
+_MIN_PHONE_DIGITS, _MAX_PHONE_DIGITS = 7, 15
+# "2019 - 2021" clears the digit count but is a date; headers that put a span of
+# years next to the contact line should not have it overwritten.
+_YEAR_RANGE_RE = re.compile(r'^\s*(?:19|20)\d{2}\s*[/–—-]\s*(?:19|20)\d{2}\s*$')
+
+# The pieces a contact line is built from, and the "•" or "|" spans that some
+# styles put between them.
+_SPAN_RE = re.compile(r'<span\b[^>]*>(?:(?!</?span\b).)*?</span>',
+                      re.IGNORECASE | re.DOTALL)
+_TAG_RE = re.compile(r'<[^>]+>')
+_SEPARATOR_ONLY_RE = re.compile(r'^[\s·•–—|/,;.\-]*$')
+
+
+def _phone_digits(text):
+    return ''.join(ch for ch in text if ch.isdigit())
+
+
+def _find_phones(text):
+    """Phone-shaped runs in `text`, minus the ones that only look like one."""
+    return [m.group(0) for m in _PHONE_RE.finditer(text)
+            if _MIN_PHONE_DIGITS <= len(_phone_digits(m.group(0))) <= _MAX_PHONE_DIGITS
+            and not _YEAR_RANGE_RE.match(m.group(0))]
+
+
+def _find_emails(text):
+    return [m.group(0) for m in _EMAIL_RE.finditer(text)]
+
+
+def _same_phone(a, b):
+    """True if two written forms plausibly denote the same number.
+
+    Compared on digits alone and from the right, because the same number is
+    written "+44 7700 900123" in one field and "07700 900123" in the other.
     """
-    
-    # Style-specific CSS with custom colors
-    style_css = {
-        "professional": f"""
-            body {{ 
-                font-family: 'Times New Roman', serif; 
-                font-size: {font_size};
-            }}
-            h1 {{ 
-                color: {primary_color}; 
-                border-bottom: 2px solid {accent_color}; 
-                padding-bottom: 8px; 
-                font-size: 18px;
-            }}
-            h2 {{ 
-                color: {accent_color}; 
-                border-left: 3px solid {secondary_color}; 
-                padding-left: 12px; 
-                font-size: 14px;
-            }}
-            h3 {{ color: #7f8c8d; font-size: 13px; }}
-            .header {{ 
-                border-bottom: 1px solid #bdc3c7; 
-                padding-bottom: 15px; 
-                margin-bottom: 20px;
-            }}
-            .content {{ 
-                font-size: {font_size}; 
-                line-height: {line_spacing};
-            }}
-        """,
-        "modern": f"""
-            body {{ 
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-                font-size: {font_size};
-            }}
-            h1 {{ 
-                color: {primary_color}; 
-                font-size: 16px; 
-                font-weight: 600; 
-                margin-bottom: 15px;
-            }}
-            h2 {{ 
-                color: {secondary_color}; 
-                font-size: 13px; 
-                font-weight: 500; 
-                margin-top: 20px;
-            }}
-            h3 {{ 
-                color: #7f8c8d; 
-                font-weight: 600; 
-                font-size: 12px;
-            }}
-            .header {{ 
-                background: linear-gradient(135deg, {secondary_color} 0%, {accent_color} 100%); 
-                color: white; 
-                padding: 20px; 
-                border-radius: 8px; 
-                margin-bottom: 20px;
-            }}
-            .content {{ 
-                background: #f8f9fa; 
-                padding: 15px; 
-                border-radius: 6px; 
-                font-size: {font_size};
-                line-height: {line_spacing};
-            }}
-        """,
-        "creative": f"""
-            body {{ 
-                font-family: 'Helvetica Neue', Arial, sans-serif; 
-                font-size: {font_size};
-            }}
-            h1 {{ 
-                color: {primary_color}; 
-                font-size: 18px; 
-                text-transform: uppercase; 
-                letter-spacing: 1px; 
-                font-weight: 600;
-            }}
-            h2 {{ 
-                color: {accent_color}; 
-                border-bottom: 2px solid {primary_color}; 
-                padding-bottom: 6px; 
-                font-size: 13px;
-            }}
-            h3 {{ 
-                color: {accent_color}; 
-                font-style: italic; 
-                font-size: 12px;
-            }}
-            .header {{ 
-                background: #ecf0f1; 
-                padding: 18px; 
-                border-left: 4px solid {primary_color}; 
-                margin-bottom: 20px;
-            }}
-            .content {{ 
-                border: 1px solid #bdc3c7; 
-                padding: 18px; 
-                border-radius: 4px; 
-                font-size: {font_size};
-                line-height: {line_spacing};
-            }}
-        """,
-        "minimal": f"""
-            body {{ 
-                font-family: 'Arial', sans-serif; 
-                max-width: 100%; 
-                margin: 0; 
-                font-size: {font_size};
-            }}
-            h1 {{ 
-                color: {primary_color}; 
-                font-size: 16px; 
-                font-weight: normal; 
-                margin-bottom: 15px;
-            }}
-            h2 {{ 
-                color: {accent_color}; 
-                font-size: 13px; 
-                font-weight: normal; 
-                border-bottom: 1px solid #bdc3c7; 
-                padding-bottom: 5px;
-            }}
-            h3 {{ 
-                color: #7f8c8d; 
-                font-weight: normal; 
-                font-size: 12px;
-            }}
-            .header {{ 
-                margin-bottom: 25px; 
-                text-align: left;
-            }}
-            .content {{ 
-                line-height: {line_spacing}; 
-                font-size: {font_size};
-            }}
-        """,
-        "elegant": f"""
-            body {{ 
-                font-family: 'Georgia', serif; 
-                font-size: {font_size};
-            }}
-            h1 {{ 
-                color: {primary_color}; 
-                font-size: 18px; 
-                font-weight: 600; 
-                margin-bottom: 15px;
-                border-bottom: 2px solid {secondary_color};
-            }}
-            h2 {{ 
-                color: {accent_color}; 
-                font-size: 14px; 
-                font-weight: 500; 
-                margin-top: 20px;
-            }}
-            h3 {{ 
-                color: {secondary_color}; 
-                font-style: italic; 
-                font-size: 12px;
-            }}
-            .header {{ 
-                background: linear-gradient(135deg, {primary_color} 0%, {accent_color} 100%); 
-                color: white; 
-                padding: 20px; 
-                border-radius: 8px; 
-                margin-bottom: 20px;
-            }}
-            .content {{ 
-                background: #fafafa; 
-                padding: 20px; 
-                border-radius: 6px; 
-                font-size: {font_size};
-                line-height: {line_spacing};
-                border-left: 3px solid {secondary_color};
-            }}
-        """,
-        "bold": f"""
-            body {{ 
-                font-family: 'Impact', 'Arial Black', sans-serif; 
-                font-size: {font_size};
-            }}
-            h1 {{ 
-                color: {primary_color}; 
-                font-size: 20px; 
-                font-weight: 900; 
-                margin-bottom: 15px;
-                text-transform: uppercase;
-            }}
-            h2 {{ 
-                color: {secondary_color}; 
-                font-size: 16px; 
-                font-weight: 700; 
-                margin-top: 20px;
-                border-bottom: 3px solid {accent_color};
-            }}
-            h3 {{ 
-                color: {accent_color}; 
-                font-weight: 700; 
-                font-size: 14px;
-            }}
-            .header {{ 
-                background: {primary_color}; 
-                color: white; 
-                padding: 25px; 
-                margin-bottom: 20px;
-                text-align: center;
-            }}
-            .content {{ 
-                background: #f8f9fa; 
-                padding: 20px; 
-                font-size: {font_size};
-                line-height: {line_spacing};
-                border: 2px solid {secondary_color};
-            }}
-        """
+    a, b = _phone_digits(a), _phone_digits(b)
+    if not a or not b:
+        return False
+    shorter, longer = sorted((a, b), key=len)
+    return len(shorter) >= _MIN_PHONE_DIGITS and longer.endswith(shorter)
+
+
+def _same_email(a, b):
+    return a.strip().lower() == b.strip().lower()
+
+
+_CONTACT_KINDS = {
+    'email': (_find_emails, _same_email),
+    'phone': (_find_phones, _same_phone),
+}
+
+
+def _element_text(html):
+    """Visible text of a markup fragment, for shape-matching against it."""
+    return unescape(_TAG_RE.sub(' ', html))
+
+
+def _contact_items(body):
+    """The contact line split into its parts: spans if it uses them, else all."""
+    spans = list(_SPAN_RE.finditer(body))
+    if spans:
+        return [(m.start(), m.end()) for m in spans]
+    return [(0, len(body))]
+
+
+def _tidy_separators(body):
+    """Drop "•" spans left stranded by a removal, at either end or doubled up."""
+    spans = list(_SPAN_RE.finditer(body))
+    if not spans:
+        return body
+    is_sep = [bool(_SEPARATOR_ONLY_RE.match(_element_text(m.group(0))))
+              for m in spans]
+    drop = set()
+    seen_value = False
+    for i, sep in enumerate(is_sep):
+        if not sep:
+            seen_value = True
+            continue
+        if not seen_value or (i - 1) in drop or (i > 0 and is_sep[i - 1]):
+            drop.add(i)
+    for i in range(len(is_sep) - 1, -1, -1):  # a trailing run of separators
+        if not is_sep[i]:
+            break
+        drop.add(i)
+    if not drop:
+        return body
+    out, cursor = [], 0
+    for i, match in enumerate(spans):
+        if i in drop:
+            out.append(body[cursor:match.start()])
+            cursor = match.end()
+    out.append(body[cursor:])
+    return ''.join(out)
+
+
+def _append_contact(body, value):
+    """Add a missing detail to the end of the contact line, in its own style."""
+    spans = list(_SPAN_RE.finditer(body))
+    addition = f'<span>{escape(value)}</span>'
+    if not spans:
+        return body + addition
+    separator = next(
+        (m.group(0) for m in spans
+         if _SEPARATOR_ONLY_RE.match(_element_text(m.group(0)))
+         and _element_text(m.group(0)).strip()),
+        '')
+    end = spans[-1].end()
+    return body[:end] + separator + addition + body[end:]
+
+
+def _rewrite_contact_line(body, supplied, from_source, report):
+    """Correct one contact element in place. See enforce_contact_details."""
+    for kind, (find_all, same) in _CONTACT_KINDS.items():
+        value = supplied.get(kind)
+        if not value:
+            # Nothing to check against. Whatever the model wrote came from the
+            # CV or from nowhere, and deleting it on that suspicion would be a
+            # worse failure than leaving it: the evidence is text extracted from
+            # a PDF, which mangles a number often enough not to trust.
+            continue
+
+        found = []  # (start, end, written form) per part of the line
+        for start, end in _contact_items(body):
+            written = find_all(_element_text(body[start:end]))
+            if written:
+                found.append((start, end, written[0].strip()))
+
+        if not found:
+            body = _append_contact(body, value)
+            report[kind] = 'added'
+            continue
+        if any(same(written, value) for _, _, written in found):
+            report[kind] = 'unchanged'  # already correct; leave the markup be
+            continue
+
+        # Correct the detail the model was least likely to have got from the CV,
+        # which is where a placeholder shows up. Other parts of the line — a
+        # LinkedIn URL, a city, a second real number — are never touched.
+        stale = [item for item in found
+                 if not any(same(item[2], known) for known in from_source[kind])]
+        target = (stale or found)[0]
+        # Repeats of the very value being corrected are the same mistake twice.
+        duplicates = [item for item in found
+                      if item is not target and same(item[2], target[2])]
+
+        rebuilt, cursor = [], 0
+        for item in found:
+            if item is not target and item not in duplicates:
+                continue
+            start, end, written = item
+            rebuilt.append(body[cursor:start])
+            if item is target:
+                rebuilt.append(body[start:end].replace(written, escape(value), 1))
+            cursor = end
+        rebuilt.append(body[cursor:])
+        body = ''.join(rebuilt)
+        if duplicates:
+            body = _tidy_separators(body)
+        report[kind] = 'corrected'
+    return body
+
+
+def enforce_contact_details(html_content: str, supplied: dict, source_text: str = ''):
+    """Make the CV header's email and phone say what the applicant said.
+
+    The prompt asks for this too, but the same prompt tells the model to rewrite
+    rather than copy the source, and the header gets caught by that: a supplied
+    phone number comes back as a stock "0123456789" often enough that callers
+    reported it as the field being ignored. Rewriting the value here makes it
+    certain, the way enforce_letter_date does for the date.
+
+    Only `supplied` details with a recognisable shape are touched — an address
+    or a city has nothing to match on and stays the prompt's job. A supplied
+    value replaces what the model wrote and is appended if it wrote none.
+    `source_text` is the applicant's own CV, used only to tell a placeholder
+    apart from a detail the CV really carries when the header holds more than
+    one of a kind.
+
+    Returns (html, report), where report maps 'email'/'phone' to what happened
+    ('unchanged', 'corrected' or 'added') and omits a kind the caller left
+    blank. An empty report means there was nothing to enforce, or the model
+    produced no `class="contact-info"` element to enforce it in.
+    """
+    supplied = {k: v.strip() for k, v in (supplied or {}).items() if v and v.strip()}
+    if not html_content or not supplied:
+        return html_content, {}
+
+    from_source = {
+        kind: find_all(source_text or '')
+        for kind, (find_all, _) in _CONTACT_KINDS.items()
     }
-    
-    # Get the selected style CSS, default to professional if not found
-    selected_css = style_css.get(style, style_css["professional"])
-    
-    # No generation date for any documents
-    generation_date_html = ""
-    
-    # Only show header if title is provided
-    header_html = ""
-    if title and title.strip():
-        header_html = f"""
-        <div class="header">
-            <h1>{title}</h1>
-            {generation_date_html}
-        </div>
-        """
-    
-    html_content = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <title>{title or 'Document'}</title>
-        <style>
-            {base_css}
-            {selected_css}
-        </style>
-    </head>
-    <body>
-        {header_html}
-        <div class="content">{content}</div>
-    </body>
-    </html>
-    """
-    
-    return html_content
+    report = {}
+
+    def rewrite(match):
+        if 'contact-info' not in match.group('cls').split():
+            return match.group(0)
+        body = _rewrite_contact_line(
+            match.group('body'), supplied, from_source, report)
+        return match.group('open') + body + match.group('close')
+
+    return _CLASSED_ELEMENT_RE.sub(rewrite, html_content), report
+
 
 def convert_html_to_pdf(html_content: str, filename: str = "document.pdf", pdf_margin: str = "0in") -> bytes:
-    """Convert HTML content to PDF using Gotenberg API"""
+    """Convert HTML content to PDF using Gotenberg API.
+
+    `pdf_margin` is a CSS length applied on all four sides. It reaches the page
+    through the injected @page rule, since preferCssPageSize makes Chromium take
+    the CSS over the form fields; the form fields are sent to match so the two
+    cannot disagree.
+    """
+    html_file_path = None
     try:
         html_content = html_content.strip()
         # Only inject @page for margins/size, do not override any other CSS
         page_css = f"""
         @page {{
-            margin: 0;
+            margin: {pdf_margin};
             size: A4;
         }}
         """
@@ -713,29 +651,36 @@ def convert_html_to_pdf(html_content: str, filename: str = "document.pdf", pdf_m
             auth = None
             if GOTENBERG_USERNAME and GOTENBERG_PASSWORD:
                 auth = (GOTENBERG_USERNAME, GOTENBERG_PASSWORD)
-            margin_val = '0'
             data = {
-                'marginTop': margin_val,
-                'marginBottom': margin_val,
-                'marginLeft': margin_val,
-                'marginRight': margin_val,
+                'marginTop': pdf_margin,
+                'marginBottom': pdf_margin,
+                'marginLeft': pdf_margin,
+                'marginRight': pdf_margin,
                 'format': 'A4',
                 'preferCssPageSize': 'true'
             }
+            # Without a timeout a hung Gotenberg holds this worker thread for the
+            # life of the process, the same way the model calls used to.
             gotenberg_response = requests.post(
                 f"{GOTENBERG_URL}/forms/chromium/convert/html",
                 files=files,
                 data=data,
-                auth=auth
+                auth=auth,
+                timeout=GOTENBERG_TIMEOUT
             )
-        os.unlink(html_file_path)
         if gotenberg_response.status_code == 200:
             return gotenberg_response.content
         else:
             raise Exception(f"PDF generation failed: {gotenberg_response.text}")
+    except requests.exceptions.Timeout:
+        raise Exception(f"PDF conversion timed out after {GOTENBERG_TIMEOUT}s")
     except Exception as e:
         raise Exception(f"PDF conversion failed: {str(e)}")
-
-def get_available_styles() -> dict:
-    """Return available CV styles"""
-    return {} 
+    finally:
+        # The unlink used to sit on the success path only, so every failed
+        # conversion left its HTML behind in the container.
+        if html_file_path:
+            try:
+                os.unlink(html_file_path)
+            except OSError:
+                logger.warning("could not remove temporary file %s", html_file_path)

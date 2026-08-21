@@ -3,15 +3,16 @@ from typing import Optional
 from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
+from starlette.background import BackgroundTask
 import requests
-from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL, AVAILABLE_MODELS, resolve_model, GOTENBERG_URL, GOTENBERG_USERNAME, GOTENBERG_PASSWORD, CORS_ALLOW_ORIGINS, ANALYSIS_MAX_TOKENS, DEFAULT_TIMEZONE
+from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, DEFAULT_MODEL, AVAILABLE_MODELS, resolve_model, model_max_tokens, GOTENBERG_URL, GOTENBERG_USERNAME, GOTENBERG_PASSWORD, CORS_ALLOW_ORIGINS, ANALYSIS_MAX_TOKENS, DEFAULT_TIMEZONE
 import tempfile
 import os
 from utils import (convert_html_to_pdf, extract_document_text, DocumentError,
-                   parse_model_json, enforce_letter_date, today_in_timezone,
-                   infer_timezone)
+                   parse_model_json, enforce_letter_date, enforce_contact_details,
+                   today_in_timezone, infer_timezone)
 from templates import get_style_template, get_style_reference, get_style_class_names
-from openrouter import chat_completion, OpenRouterError
+from openrouter import chat_completion, chat_completion_with_reason, OpenRouterError
 from prompts import build_analysis_prompt, wrap_user_instructions
 import json as pyjson
 
@@ -52,6 +53,31 @@ app.add_middleware(
 # 2. Remove /upload endpoint
 # 3. Refactor /optimize-cv and /generate-cover-letter to accept all required parameters directly as form fields or files
 # 4. Update all usages to use request data only
+
+def _pdf_response(pdf_content: bytes, filename: str) -> FileResponse:
+    """Serve a generated PDF from a temp file, and delete it once it is sent.
+
+    FileResponse needs a path, so the bytes have to land on disk. Every one of
+    these used to be written with delete=False and no cleanup, so a container
+    accumulated one orphaned PDF per download until the disk filled.
+    """
+    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as pdf_file:
+        pdf_file.write(pdf_content)
+        path = pdf_file.name
+
+    def remove():
+        try:
+            os.unlink(path)
+        except OSError:
+            logger.warning("could not remove temporary file %s", path)
+
+    return FileResponse(
+        path,
+        media_type='application/pdf',
+        filename=filename,
+        background=BackgroundTask(remove)
+    )
+
 
 @app.post('/optimize-cv')
 def optimize_cv(
@@ -113,6 +139,10 @@ def optimize_cv(
 - You must REWRITE, OPTIMIZE, and TAILOR the CV content for the provided job description and ATS requirements.
 - Use the old CV only as a reference for facts and achievements.
 - Do NOT copy or reuse the old CV text directly. Instead, summarize, rephrase, and enhance the user's experience, skills, and summary for the target job.
+- The rewrite rule applies to prose only. Contact details, names, employers, job
+  titles, institutions and dates are facts: reproduce them exactly as given.
+  Never invent a phone number, email address or any other contact detail, and
+  never substitute a sample one such as 0123456789 or (555) 123-4567.
 - Integrate relevant keywords and requirements from the job description naturally.
 - The output must be concise, impactful, and fit on a single A4 page.
 - ONLY include skills, experiences, and claims that are supported by the user's actual CV and the analysis below. Do NOT add anything the user cannot do.
@@ -158,8 +188,10 @@ Generate CVs with these sections in order:
 
 
 ## Input Data
-Use only the contact details that are filled in. Omit any that are blank, and never
-write a placeholder or the word "None".
+These are the applicant's real contact details. Put each filled-in value in the
+header verbatim, character for character. Omit any that are blank rather than
+inventing, guessing or carrying over a value from the old CV, and never write a
+placeholder or the word "None".
 - Name: {full_name or ''}
 - Email: {email or ''}
 - Phone: {phone or ''}
@@ -183,8 +215,9 @@ Generate the CV as a complete HTML document with:
     prompt += wrap_user_instructions(user_query)
 
     try:
-        html_content = chat_completion(
-            selected_model, prompt, temperature=0.7, max_tokens=4000)
+        html_content, finish_reason = chat_completion_with_reason(
+            selected_model, prompt, temperature=0.7,
+            max_tokens=model_max_tokens(selected_model))
         
         # Clean up the HTML content (remove any markdown formatting if present)
         if html_content.startswith('```html'):
@@ -192,31 +225,45 @@ Generate the CV as a complete HTML document with:
         if html_content.endswith('```'):
             html_content = html_content[:-3]
         html_content = html_content.strip()
-        
+
+        # Belt and braces over the prompt: the model still owns its output, and
+        # the header is where it reaches for a sample value. Overwrite the
+        # details the caller actually gave us rather than trust them.
+        supplied_contact = {'email': email, 'phone': phone}
+        html_content, contact_report = enforce_contact_details(
+            html_content, supplied_contact, cv_extracted_text)
+        for field, value in supplied_contact.items():
+            if value and field not in contact_report:
+                logger.warning(
+                    "%s supplied but the CV has no class=\"contact-info\" element "
+                    "to pin it in model=%s", field, selected_model)
+
+        # A reply that ran out of tokens is a CV cut off mid-tag. It used to be
+        # returned as a success and rendered into a PDF that looked finished.
+        truncated = finish_reason == 'length'
+        if truncated:
+            logger.warning("CV generation truncated at max_tokens model=%s", selected_model)
+
         response_data = {
             'message': 'CV optimized successfully',
             'html_content': html_content,
             'model_used': selected_model,
-            'analysis': analysis_json
+            'analysis': analysis_json,
+            'contact_enforced': contact_report,
+            'truncated': truncated
         }
-        
+
         # Generate PDF if requested
-        if generate_pdf:
+        if generate_pdf and truncated:
+            response_data['pdf_error'] = (
+                'The model ran out of output tokens and the CV is incomplete, so '
+                'no PDF was produced. Retry, or use a model with a larger output '
+                'limit.'
+            )
+        elif generate_pdf:
             try:
                 pdf_content = convert_html_to_pdf(html_content, "optimized_cv.pdf")
-                
-                # Create temporary PDF file
-                with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as pdf_file:
-                    pdf_file.write(pdf_content)
-                    pdf_file_path = pdf_file.name
-                
-                # Return PDF file
-                return FileResponse(
-                    pdf_file_path,
-                    media_type='application/pdf',
-                    filename=f"optimized_cv.pdf",
-                    background=None
-                )
+                return _pdf_response(pdf_content, "optimized_cv.pdf")
             except Exception as e:
                 response_data['pdf_error'] = f'PDF generation failed: {str(e)}'
         
@@ -226,6 +273,43 @@ Generate the CV as a complete HTML document with:
         return JSONResponse({'error': f'API request failed: {str(e)}'}, status_code=500)
     except Exception as e:
         return JSONResponse({'error': f'Optimization failed: {str(e)}'}, status_code=500)
+
+# Headings a CV puts above the name, which the old "first usable line" rule
+# happily returned as the applicant's name.
+_NOT_A_NAME = (
+    'curriculum vitae', 'curriculum-vitae', 'resume', 'résumé', 'cv',
+    'personal details', 'personal information', 'profile', 'contact',
+    'contact details', 'contact information',
+)
+
+
+def _infer_name(cv_text):
+    """Best guess at the applicant's name from the top of their CV, or None.
+
+    Only used when the caller sends no full_name. Guessing wrong puts a stranger's
+    name on the letter, so a line has to look like a name — no digits, no address
+    or contact punctuation, no section heading — and anything else is skipped
+    rather than accepted.
+    """
+    for line in (cv_text or '').split('\n')[:8]:
+        line = ' '.join(line.split())
+        if not line or len(line) > 60:
+            continue
+        if line.lower().strip('.:-') in _NOT_A_NAME:
+            continue
+        if any(ch.isdigit() for ch in line) or any(ch in line for ch in '@|/\\'):
+            continue
+        if line.lower().startswith(
+                ('email', 'e-mail', 'phone', 'tel', 'mobile', 'address',
+                 'summary', 'experience', 'objective', 'skills', 'education')):
+            continue
+        # Two words minimum: it drops the lone city or job title that sits above
+        # a name, at the cost of a mononym the caller can always pass explicitly.
+        if len([w for w in line.split() if any(ch.isalpha() for ch in w)]) < 2:
+            continue
+        return line
+    return None
+
 
 @app.post('/generate-cover-letter')
 def generate_cover_letter(
@@ -269,12 +353,7 @@ def generate_cover_letter(
     
     # Try to extract name from CV if not provided
     if not contact_full_name:
-        cv_lines = cv_extracted_text.split('\n')
-        for line in cv_lines[:5]:
-            line = line.strip()
-            if line and not line.lower().startswith(('email', 'phone', 'address', 'summary', 'experience')):
-                contact_full_name = line
-                break
+        contact_full_name = _infer_name(cv_extracted_text)
     
     # Use provided model or fall back to default
     selected_model = resolve_model(model)
@@ -384,7 +463,11 @@ Generate the cover letter as a complete HTML document with:
 - Mobile-responsive structure
 
 ## Example Cover Letter (Reference Only)
-Use the following example as a reference for structure, style, and best practices (do not copy content):
+Use the following example as a reference for structure, style, and best practices (do not copy content).
+Its name, email address, phone number, employers and companies are invented
+filler for the layout. Never carry any of them into your output, and never
+replace a detail you were given with one of them or with any other sample value.
+Use the applicant's own details from Input Parameters, exactly as written.
 
 <!DOCTYPE html>
 <html lang=\"en\">
@@ -695,8 +778,9 @@ CV Content:
 """
     
     try:
-        html_content = chat_completion(
-            selected_model, prompt, temperature=0.8, max_tokens=3000)
+        html_content, finish_reason = chat_completion_with_reason(
+            selected_model, prompt, temperature=0.8,
+            max_tokens=model_max_tokens(selected_model))
         
         # Clean up the HTML content
         if html_content.startswith('```html'):
@@ -713,14 +797,32 @@ CV Content:
                 "cover letter has no class=\"date\" element to pin model=%s",
                 selected_model)
 
+        # Same treatment for the letterhead. The example letter in the prompt
+        # above carries a sample email and phone number, which is exactly what a
+        # model reaches for when it is rewriting rather than copying.
+        supplied_contact = {'email': contact_email, 'phone': contact_phone}
+        html_content, contact_report = enforce_contact_details(
+            html_content, supplied_contact, cv_extracted_text)
+        for field, value in supplied_contact.items():
+            if value and field not in contact_report:
+                logger.warning(
+                    "%s supplied but the letter has no class=\"contact-info\" "
+                    "element to pin it in model=%s", field, selected_model)
+
+        truncated = finish_reason == 'length'
+        if truncated:
+            logger.warning("cover letter truncated at max_tokens model=%s", selected_model)
+
         response_data = {
             'message': 'Cover letter generated successfully',
             'html_content': html_content,
+            'truncated': truncated,
             'model_used': selected_model,
             'letter_date': current_date,
             'letter_date_enforced': bool(dates_rewritten),
             'letter_timezone': zone_used,
             'letter_timezone_source': None if supplied_date else zone_source,
+            'contact_enforced': contact_report,
             'contact_info_used': {
                 'full_name': contact_full_name,
                 'address': contact_address,
@@ -730,19 +832,17 @@ CV Content:
             }
         }
         
-        if generate_pdf:
+        if generate_pdf and truncated:
+            response_data['pdf_error'] = (
+                'The model ran out of output tokens and the letter is incomplete, '
+                'so no PDF was produced. Retry, or use a model with a larger '
+                'output limit.'
+            )
+        elif generate_pdf:
             try:
-                from utils import convert_html_to_pdf
-                pdf_content = convert_html_to_pdf(html_content, "cover_letter.pdf", pdf_margin="0.4in")
-                with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as pdf_file:
-                    pdf_file.write(pdf_content)
-                    pdf_file_path = pdf_file.name
-                return FileResponse(
-                    pdf_file_path,
-                    media_type='application/pdf',
-                    filename=f"cover_letter.pdf",
-                    background=None
-                )
+                pdf_content = convert_html_to_pdf(
+                    html_content, "cover_letter.pdf", pdf_margin="0.4in")
+                return _pdf_response(pdf_content, "cover_letter.pdf")
             except Exception as e:
                 response_data['pdf_error'] = f'PDF generation failed: {str(e)}'
         
@@ -805,10 +905,6 @@ def analyze_cv(
 @app.get('/')
 def read_root():
     return {"message": "CV Maker API - AI-Powered Resume and Cover Letter Generator"}
-
-@app.get('/docs')
-def get_docs():
-    return {"message": "API documentation available at /docs endpoint"}
 
 @app.get('/health', response_class=JSONResponse)
 def health_check():

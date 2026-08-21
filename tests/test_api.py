@@ -4,9 +4,12 @@ Run with:  pytest
 
 OpenRouter is always stubbed; no test makes a real network call.
 """
+import glob
+import io
 import json
 import os
 import sys
+import tempfile
 
 import pytest
 import requests
@@ -19,6 +22,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 import config  # noqa: E402
 import openrouter  # noqa: E402
 import templates  # noqa: E402
+import utils  # noqa: E402
 import main  # noqa: E402
 from utils import extract_document_text, DocumentError  # noqa: E402
 
@@ -475,8 +479,11 @@ def test_cover_letter_without_personalisation_still_works(client, stub_openroute
 
 def test_cover_letter_prompt_pins_todays_date(client, stub_openrouter):
     """Left unpinned, the model invents a date rather than admitting it has none."""
-    from datetime import datetime
-    today = datetime.now().strftime('%B %d, %Y')
+    # Computed in the app's own default zone, not the machine's. Reading the
+    # local clock made this test fail for the hours each day when the two are on
+    # different dates — which is the very bug the endpoint exists to avoid.
+    from utils import today_in_timezone
+    today = today_in_timezone(config.DEFAULT_TIMEZONE)
     r = client.post('/generate-cover-letter', data={'cv_text': CV, 'job_desc_text': JD})
     assert r.status_code == 200
     assert r.json()['letter_date'] == today
@@ -598,9 +605,9 @@ def test_resolve_timezone_handles_the_shapes_clients_send():
 def test_cover_letter_date_element_is_overwritten(client, stub_openrouter, monkeypatch):
     """The prompt makes the right date likely; this makes it certain."""
     import main
-    monkeypatch.setattr(main, 'chat_completion', lambda *a, **k: (
+    monkeypatch.setattr(main, 'chat_completion_with_reason', lambda *a, **k: (
         '<html><body><div class="date">March 2025</div>'
-        '<div class="salutation">Dear Hiring Manager,</div></body></html>'))
+        '<div class="salutation">Dear Hiring Manager,</div></body></html>', 'stop'))
     r = client.post('/generate-cover-letter', data={
         'cv_text': CV, 'job_desc_text': JD, 'letter_date': '15 August 2026'})
     assert r.status_code == 200
@@ -613,7 +620,8 @@ def test_cover_letter_date_element_is_overwritten(client, stub_openrouter, monke
 def test_cover_letter_without_date_element_is_left_intact(client, stub_openrouter, monkeypatch):
     import main
     original = '<html><body><p>Dear Hiring Manager,</p></body></html>'
-    monkeypatch.setattr(main, 'chat_completion', lambda *a, **k: original)
+    monkeypatch.setattr(main, 'chat_completion_with_reason',
+                        lambda *a, **k: (original, 'stop'))
     r = client.post('/generate-cover-letter', data={'cv_text': CV, 'job_desc_text': JD})
     assert r.status_code == 200
     assert r.json()['html_content'] == original
@@ -670,3 +678,314 @@ def test_error_responses_carry_cors_headers(client):
                     headers={'Origin': 'https://example.com'})
     assert r.status_code == 400
     assert r.headers.get('access-control-allow-origin') == '*'
+
+
+# --- contact details in the generated CV -----------------------------------
+
+CONTACT_HTML = (
+    '<!DOCTYPE html><html><body><div class="resume"><div class="header">'
+    '<div class="name">JANE DOE</div>'
+    '<div class="contact-info">'
+    '<span>john.smith@email.com</span><span>&bull;</span>'
+    '<span>0123456789</span><span>&bull;</span>'
+    '<span>linkedin.com/in/janedoe</span>'
+    '</div></div></div></body></html>'
+)
+
+
+@pytest.fixture
+def stub_placeholder_cv(monkeypatch):
+    """A model that fills the header with sample contact details, as they do."""
+    def fake_post(url, headers=None, json=None, **kwargs):
+        prompt = json['messages'][0]['content']
+        content = ANALYSIS if 'Return ONLY the JSON object' in prompt else CONTACT_HTML
+        return StubResponse(200, _completion(content))
+
+    monkeypatch.setattr(openrouter.requests, 'post', fake_post)
+
+
+def _optimize(client, **fields):
+    data = {'cv_text': CV, 'job_desc_text': JD}
+    data.update(fields)
+    return client.post('/optimize-cv', data=data).json()
+
+
+def test_supplied_phone_replaces_the_models_placeholder(client, stub_placeholder_cv):
+    """The reported bug: the header kept saying 0123456789 whatever was sent."""
+    body = _optimize(client, phone='+44 7700 900123')
+    assert '+44 7700 900123' in body['html_content']
+    assert '0123456789' not in body['html_content']
+    assert body['contact_enforced']['phone'] == 'corrected'
+
+
+def test_supplied_email_replaces_the_models_placeholder(client, stub_placeholder_cv):
+    body = _optimize(client, email='jane@real.com')
+    assert 'jane@real.com' in body['html_content']
+    assert 'john.smith@email.com' not in body['html_content']
+    assert body['contact_enforced']['email'] == 'corrected'
+
+
+def test_enforcement_leaves_the_rest_of_the_header_alone(client, stub_placeholder_cv):
+    body = _optimize(client, phone='+44 7700 900123')
+    assert 'linkedin.com/in/janedoe' in body['html_content']
+    assert 'JANE DOE' in body['html_content']
+
+
+def test_contact_details_not_supplied_are_left_to_the_prompt(client, stub_placeholder_cv):
+    """Deleting on suspicion would be worse: the evidence is PDF-extracted text."""
+    body = _optimize(client)
+    assert body['html_content'] == CONTACT_HTML
+    assert body['contact_enforced'] == {}
+
+
+def test_phone_already_correct_is_reported_but_not_rewritten(client, stub_placeholder_cv):
+    body = _optimize(client, phone='012 345 6789')  # same digits, spaced
+    assert body['contact_enforced']['phone'] == 'unchanged'
+    assert '0123456789' in body['html_content']
+
+
+def test_supplied_phone_is_added_when_the_model_omits_it(client, monkeypatch):
+    html = ('<html><body><div class="contact-info">'
+            '<span>jane@real.com</span></div></body></html>')
+
+    def fake_post(url, headers=None, json=None, **kwargs):
+        prompt = json['messages'][0]['content']
+        content = ANALYSIS if 'Return ONLY the JSON object' in prompt else html
+        return StubResponse(200, _completion(content))
+
+    monkeypatch.setattr(openrouter.requests, 'post', fake_post)
+    body = _optimize(client, phone='0803 111 2222')
+    assert '0803 111 2222' in body['html_content']
+    assert body['contact_enforced']['phone'] == 'added'
+
+
+def test_enforcement_escapes_the_supplied_value(client, stub_placeholder_cv):
+    body = _optimize(client, phone='<script>alert(1)</script>0803 111 2222')
+    assert '<script>' not in body['html_content']
+
+
+def test_prompt_forbids_inventing_contact_details(client, stub_openrouter):
+    client.post('/optimize-cv', data={'cv_text': CV, 'job_desc_text': JD})
+    prompt = _generation_prompt(stub_openrouter)
+    assert 'Never invent a phone number' in prompt
+
+
+def test_enforce_contact_details_unit():
+    from utils import enforce_contact_details
+
+    line = ('<div class="contact-info"><span>(555) 123-4567</span>'
+            '<span>&bull;</span><span>Lagos, NG</span></div>')
+
+    # A number the CV really carries is preferred over one it does not, when the
+    # header holds both.
+    two = ('<div class="contact-info"><span>0123456789</span><span>&bull;</span>'
+           '<span>+44 7700 900123</span></div>')
+    out, report = enforce_contact_details(
+        two, {'phone': '+44 20 7946 0000'}, 'CV says +44 7700 900123')
+    assert '+44 20 7946 0000' in out and '+44 7700 900123' in out
+    assert '0123456789' not in out
+    assert report['phone'] == 'corrected'
+
+    # A repeat of the same placeholder goes with it, separators tidied.
+    dupes = ('<div class="contact-info"><span>0123456789</span><span>&bull;</span>'
+             '<span>0123456789</span><span>&bull;</span><span>Lagos</span></div>')
+    out, _ = enforce_contact_details(dupes, {'phone': '0803 111 2222'}, '')
+    assert out.count('0803 111 2222') == 1
+    assert '0123456789' not in out
+    assert '&bull;</span><span>&bull;' not in out
+
+    # A year range next to the contact line is not a phone number.
+    dated = '<div class="contact-info"><span>Lagos</span><span>2019 - 2021</span></div>'
+    out, report = enforce_contact_details(dated, {'phone': '0803 111 2222'}, '')
+    assert '2019 - 2021' in out
+    assert report['phone'] == 'added'
+
+    # No contact element to work in: reported, and nothing is touched.
+    out, report = enforce_contact_details(
+        '<div class="head"><span>0123456789</span></div>', {'phone': '0803'}, '')
+    assert report == {} and '0123456789' in out
+
+    # An unchanged detail is not rewritten at all.
+    out, report = enforce_contact_details(line, {'phone': '+1 555 123 4567'}, '')
+    assert out == line and report['phone'] == 'unchanged'
+
+
+# --- input handling --------------------------------------------------------
+
+def _upload(name, data=b'hello'):
+    return {'cv_file': (name, io.BytesIO(data), 'application/octet-stream')}
+
+
+def test_uppercase_extensions_are_accepted(client, stub_openrouter):
+    """Phones and Windows send CV.PDF; endswith('.pdf') used to reject it."""
+    r = client.post('/optimize-cv',
+                    data={'job_desc_text': JD},
+                    files={'cv_file': ('CV.TXT', io.BytesIO(CV.encode()), 'text/plain')})
+    assert r.status_code == 200
+
+
+def test_blank_cv_text_is_rejected_before_spending_a_call(client, stub_openrouter):
+    r = client.post('/optimize-cv', data={'cv_text': '   ', 'job_desc_text': JD})
+    assert r.status_code == 400
+    assert 'No CV provided' in r.json()['error']
+    assert stub_openrouter == []
+
+
+def test_empty_file_is_rejected(client, stub_openrouter):
+    r = client.post('/optimize-cv',
+                    data={'job_desc_text': JD},
+                    files={'cv_file': ('cv.txt', io.BytesIO(b'   \n'), 'text/plain')})
+    assert r.status_code == 400
+    assert 'empty' in r.json()['error']
+    assert stub_openrouter == []
+
+
+def test_image_only_pdf_says_so(monkeypatch):
+    """A scanned CV yields no text; it used to reach the model as an empty string."""
+    class Page:
+        def extract_text(self):
+            return ''
+
+    monkeypatch.setattr('utils.PdfReader', lambda f: type('R', (), {'pages': [Page()]})())
+
+    class Upload:
+        filename = 'scan.pdf'
+        file = io.BytesIO(b'%PDF-1.4')
+
+    with pytest.raises(DocumentError) as excinfo:
+        extract_document_text(Upload(), None, 'CV')
+    assert 'scan' in excinfo.value.message
+
+
+def test_infer_name_skips_headings_and_addresses():
+    assert main._infer_name('CURRICULUM VITAE\nJane Doe\nEngineer') == 'Jane Doe'
+    assert main._infer_name('RESUME\n\nOlumide Ola\n+234 803 111 2222') == 'Olumide Ola'
+    assert main._infer_name('12 High Street\nLondon\nSam Blake') == 'Sam Blake'
+    assert main._infer_name('jane@example.com\nJane Doe') == 'Jane Doe'
+    assert main._infer_name('') is None
+
+
+# --- truncated replies -----------------------------------------------------
+
+@pytest.fixture
+def stub_truncated(monkeypatch):
+    """A model that runs out of output tokens mid-document."""
+    def fake_post(url, headers=None, json=None, **kwargs):
+        prompt = json['messages'][0]['content']
+        if 'Return ONLY the JSON object' in prompt:
+            return StubResponse(200, _completion(ANALYSIS))
+        payload = {"choices": [{"message": {"content": '<html><body><div clas'},
+                                "finish_reason": "length"}]}
+        return StubResponse(200, payload)
+
+    monkeypatch.setattr(openrouter.requests, 'post', fake_post)
+
+
+def test_truncated_cv_is_flagged_not_passed_off_as_finished(client, stub_truncated):
+    body = client.post('/optimize-cv', data={'cv_text': CV, 'job_desc_text': JD}).json()
+    assert body['truncated'] is True
+
+
+def test_truncated_cv_is_not_converted_to_a_pdf(client, stub_truncated, monkeypatch):
+    monkeypatch.setattr(main, 'convert_html_to_pdf',
+                        lambda *a, **k: pytest.fail('converted a truncated CV'))
+    r = client.post('/optimize-cv',
+                    data={'cv_text': CV, 'job_desc_text': JD, 'generate_pdf': 'true'})
+    assert r.status_code == 200
+    assert 'incomplete' in r.json()['pdf_error']
+
+
+def test_complete_replies_are_not_flagged(client, stub_openrouter):
+    body = client.post('/optimize-cv', data={'cv_text': CV, 'job_desc_text': JD}).json()
+    assert body['truncated'] is False
+
+
+def test_generation_uses_the_models_advertised_output_cap(client, stub_openrouter):
+    client.post('/optimize-cv', data={'cv_text': CV, 'job_desc_text': JD})
+    assert stub_openrouter[1]['payload']['max_tokens'] == config.model_max_tokens(
+        config.DEFAULT_MODEL)
+
+
+# --- the cover letter gets the same contact treatment ----------------------
+
+def test_cover_letter_contact_details_are_enforced(client, monkeypatch):
+    letter = ('<html><body><div class="contact-info">'
+              'sarah.johnson@email.com<br>(555) 123-4567<br>New York, NY'
+              '</div><div class="date">x</div></body></html>')
+    monkeypatch.setattr(main, 'chat_completion_with_reason',
+                        lambda *a, **k: (letter, 'stop'))
+    body = client.post('/generate-cover-letter', data={
+        'cv_text': CV, 'job_desc_text': JD,
+        'email': 'jane@real.com', 'phone': '+234 803 111 2222'}).json()
+    assert '+234 803 111 2222' in body['html_content']
+    assert 'jane@real.com' in body['html_content']
+    assert '(555) 123-4567' not in body['html_content']
+    assert 'sarah.johnson@email.com' not in body['html_content']
+    assert body['contact_enforced'] == {'email': 'corrected', 'phone': 'corrected'}
+
+
+def test_cover_letter_prompt_disowns_the_examples_contacts(client, stub_openrouter):
+    client.post('/generate-cover-letter', data={'cv_text': CV, 'job_desc_text': JD})
+    prompt = stub_openrouter[0]['payload']['messages'][0]['content']
+    assert 'Never carry any of them into your output' in prompt
+
+
+# --- PDF conversion --------------------------------------------------------
+
+class StubPdfResponse:
+    status_code = 200
+    content = b'%PDF-1.4'
+    text = ''
+
+
+def test_pdf_conversion_times_out_rather_than_hanging(monkeypatch):
+    seen = {}
+
+    def fake_post(url, files=None, data=None, auth=None, timeout=None):
+        seen.update(timeout=timeout, data=data)
+        return StubPdfResponse()
+
+    monkeypatch.setattr(utils.requests, 'post', fake_post)
+    html = '<html><head><style>.a{}</style></head><body>x</body></html>'
+    assert utils.convert_html_to_pdf(html, pdf_margin='0.4in') == b'%PDF-1.4'
+    assert seen['timeout'] == config.GOTENBERG_TIMEOUT
+    # The margin used to be dropped on the floor and hardcoded to zero.
+    assert seen['data']['marginTop'] == '0.4in'
+
+
+def test_pdf_margin_reaches_the_page_css(monkeypatch):
+    seen = {}
+
+    def fake_post(url, files=None, data=None, auth=None, timeout=None):
+        seen['html'] = files['index.html'][1].read().decode()
+        return StubPdfResponse()
+
+    monkeypatch.setattr(utils.requests, 'post', fake_post)
+    utils.convert_html_to_pdf(
+        '<html><head><style>.a{}</style></head><body>x</body></html>',
+        pdf_margin='0.4in')
+    # preferCssPageSize makes Chromium follow @page over the form fields.
+    assert 'margin: 0.4in' in seen['html']
+
+
+def test_pdf_conversion_cleans_up_after_a_failure(monkeypatch, tmp_path):
+    before = set(glob.glob(os.path.join(tempfile.gettempdir(), '*.html')))
+
+    def boom(*a, **k):
+        raise requests.exceptions.ConnectionError('gotenberg down')
+
+    monkeypatch.setattr(utils.requests, 'post', boom)
+    with pytest.raises(Exception):
+        utils.convert_html_to_pdf('<html><body>x</body></html>')
+    after = set(glob.glob(os.path.join(tempfile.gettempdir(), '*.html')))
+    assert after == before
+
+
+def test_pdf_download_leaves_no_temp_file(client, stub_openrouter, monkeypatch):
+    monkeypatch.setattr(main, 'convert_html_to_pdf', lambda *a, **k: b'%PDF-1.4')
+    before = set(glob.glob(os.path.join(tempfile.gettempdir(), '*.pdf')))
+    r = client.post('/optimize-cv',
+                    data={'cv_text': CV, 'job_desc_text': JD, 'generate_pdf': 'true'})
+    assert r.status_code == 200 and r.content.startswith(b'%PDF')
+    after = set(glob.glob(os.path.join(tempfile.gettempdir(), '*.pdf')))
+    assert after == before

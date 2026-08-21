@@ -41,11 +41,27 @@ def chat_completion(model: str, prompt: str, temperature: float, max_tokens: int
                     json_mode: bool = False) -> str:
     """Send one prompt to OpenRouter and return the message content.
 
+    Callers that render the reply as a document should use
+    chat_completion_with_reason instead, so they can tell a finished reply from
+    one the token cap cut short.
+
+    Raises OpenRouterError with a readable message on any failure.
+    """
+    return chat_completion_with_reason(
+        model, prompt, temperature, max_tokens, json_mode)[0]
+
+
+def chat_completion_with_reason(model: str, prompt: str, temperature: float,
+                                max_tokens: int, json_mode: bool = False):
+    """As chat_completion, but returns (content, finish_reason).
+
+    A finish_reason of "length" means max_tokens ran out mid-reply. That used to
+    be invisible: a CV cut off mid-tag came back as a success and was converted
+    into a partial PDF, because only the content was ever looked at.
+
     With json_mode the provider is asked to guarantee a JSON object, which stops
     models wrapping replies in a ```json fence. Not every model supports it, so
     a rejection falls back to a plain call rather than failing the request.
-
-    Raises OpenRouterError with a readable message on any failure.
     """
     if not OPENROUTER_API_KEY:
         raise OpenRouterError("OPENROUTER_API_KEY is not configured")
@@ -114,9 +130,16 @@ def _post(data, model):
         raise OpenRouterError(f"Model provider error: {_stringify(result['error'])}")
 
     try:
-        return result['choices'][0]['message']['content']
+        choice = result['choices'][0]
+        content = choice['message']['content']
     except (KeyError, IndexError, TypeError):
         raise OpenRouterError("Model provider returned no completion")
+
+    finish_reason = choice.get('finish_reason') if isinstance(choice, dict) else None
+    if finish_reason == 'length':
+        logger.warning("reply truncated at max_tokens=%s model=%s",
+                       data.get('max_tokens'), model)
+    return content, finish_reason
 
 
 def _error_detail(response):
