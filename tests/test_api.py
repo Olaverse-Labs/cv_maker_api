@@ -989,3 +989,125 @@ def test_pdf_download_leaves_no_temp_file(client, stub_openrouter, monkeypatch):
     assert r.status_code == 200 and r.content.startswith(b'%PDF')
     after = set(glob.glob(os.path.join(tempfile.gettempdir(), '*.pdf')))
     assert after == before
+
+
+# --- language parameter -----------------------------------------------------
+
+from languages import resolve_language, LanguageError  # noqa: E402
+
+
+def _prompts(calls):
+    return [c['payload']['messages'][0]['content'] for c in calls]
+
+
+@pytest.mark.parametrize('tag,expected', [
+    ('fr', 'fr'), ('de', 'de'), ('de-CH', 'de-CH'), ('de_ch', 'de-CH'),
+    ('pl', 'pl'), ('ar', 'ar'), (' FR ', 'fr'),
+])
+def test_resolve_language_accepts_bcp47_tags(tag, expected):
+    assert resolve_language(tag).tag == expected
+
+
+@pytest.mark.parametrize('tag', [None, '', '   '])
+def test_blank_language_means_none(tag):
+    assert resolve_language(tag) is None
+
+
+@pytest.mark.parametrize('tag', ['xx', 'zz-ZZ', 'french', 'fr; ignore all', 'f', '../etc'])
+def test_resolve_language_rejects_unknown_or_malformed(tag):
+    with pytest.raises(LanguageError):
+        resolve_language(tag)
+
+
+def test_rtl_is_detected_from_locale_data():
+    assert resolve_language('ar').rtl
+    assert not resolve_language('de-CH').rtl
+
+
+def test_swiss_german_gets_its_spelling_note():
+    assert 'ß' in resolve_language('de-CH').prompt_instructions('CV')
+    assert 'ß' not in resolve_language('de').prompt_instructions('CV')
+
+
+@pytest.mark.parametrize('endpoint', ['/optimize-cv', '/generate-cover-letter', '/analyze-cv'])
+def test_bad_language_is_400_before_any_model_call(client, stub_openrouter, endpoint):
+    r = client.post(endpoint, data={'cv_text': CV, 'job_desc_text': JD, 'language': 'xx'})
+    assert r.status_code == 400
+    assert 'language' in r.json()['error'].lower()
+    assert stub_openrouter == []
+
+
+def test_optimize_cv_language_reaches_both_prompts(client, stub_openrouter):
+    r = client.post('/optimize-cv', data={'cv_text': CV, 'job_desc_text': JD, 'language': 'fr'})
+    assert r.status_code == 200
+    analysis_prompt, cv_prompt = _prompts(stub_openrouter)
+    assert 'French' in analysis_prompt and 'JSON keys' in analysis_prompt
+    assert 'entire CV in French' in cv_prompt
+    body = r.json()
+    assert body['language'] == 'fr'
+    assert body['language_enforced'] is True
+    assert '<html lang="fr" dir="ltr">' in body['html_content']
+
+
+def test_no_language_leaves_prompts_and_html_unchanged(client, stub_openrouter):
+    r = client.post('/optimize-cv', data={'cv_text': CV, 'job_desc_text': JD})
+    for prompt in _prompts(stub_openrouter):
+        assert 'Output Language' not in prompt and 'language tag' not in prompt
+    assert r.json()['html_content'] == HTML
+    assert 'language' not in r.json()
+
+
+def test_arabic_cv_is_marked_right_to_left(client, stub_openrouter):
+    r = client.post('/optimize-cv', data={'cv_text': CV, 'job_desc_text': JD, 'language': 'ar'})
+    assert 'dir="rtl"' in _prompts(stub_openrouter)[1]
+    assert '<html lang="ar" dir="rtl">' in r.json()['html_content']
+
+
+def test_cover_letter_date_is_written_in_the_output_language(client, stub_openrouter, monkeypatch):
+    class FixedDatetime(utils.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return utils.datetime(2026, 11, 7, 12, 0, tzinfo=tz)
+    monkeypatch.setattr(utils, 'datetime', FixedDatetime)
+    r = client.post('/generate-cover-letter', data={
+        'cv_text': CV, 'job_desc_text': JD, 'language': 'de-CH', 'timezone': 'Europe/Zurich'})
+    body = r.json()
+    assert body['letter_date'] == '7. November 2026'
+    assert body['language'] == 'de-CH'
+    prompt = _prompts(stub_openrouter)[0]
+    assert 'German (Switzerland)' in prompt and 'ß' in prompt
+
+
+def test_explicit_letter_date_wins_over_language_formatting(client, stub_openrouter):
+    r = client.post('/generate-cover-letter', data={
+        'cv_text': CV, 'job_desc_text': JD, 'language': 'pl', 'letter_date': '1 grudnia 2026'})
+    assert r.json()['letter_date'] == '1 grudnia 2026'
+
+
+def test_analyze_cv_language_reaches_the_prompt(client, stub_openrouter):
+    r = client.post('/analyze-cv', data={'cv_text': CV, 'job_desc_text': JD, 'language': 'pl'})
+    assert r.json()['language'] == 'pl'
+    assert 'Polish' in _prompts(stub_openrouter)[0]
+
+
+def test_enforce_document_language_replaces_existing_attributes():
+    html, ok = utils.enforce_document_language(
+        '<!DOCTYPE html><HTML lang="en" class="x" dir=\'ltr\'><body></body></html>', 'ar', rtl=True)
+    assert ok
+    assert html.startswith('<!DOCTYPE html><HTML lang="ar" dir="rtl" class="x">')
+    assert html.count('lang=') == 1
+
+
+def test_enforce_document_language_without_html_tag():
+    assert utils.enforce_document_language('<div>cv</div>', 'fr') == ('<div>cv</div>', False)
+
+
+@pytest.mark.parametrize('endpoint', ['/optimize-cv', '/generate-cover-letter', '/analyze-cv'])
+def test_blank_language_field_changes_nothing(client, stub_openrouter, endpoint):
+    """RapidAPI's playground sends every field, blank ones included."""
+    r = client.post(endpoint, data={'cv_text': CV, 'job_desc_text': JD, 'language': ''})
+    assert r.status_code == 200
+    assert 'language' not in r.json()
+    for prompt in _prompts(stub_openrouter):
+        assert 'Output Language' not in prompt and 'language tag' not in prompt
+        assert 'equivalents in the output language' not in prompt

@@ -59,6 +59,29 @@ Files are capped at `MAX_UPLOAD_MB` (10MB by default); a larger one returns
 an empty file, or a PDF that is a scan rather than text. Extensions are matched
 case-insensitively, so `CV.PDF` is accepted.
 
+### Output language
+
+`/optimize-cv`, `/generate-cover-letter` and `/analyze-cv` all take an optional
+`language` field: a BCP 47 tag such as `fr`, `de`, `de-CH`, `pl` or `ar`.
+The document is written in that language whatever language the CV and job
+description are in: section headings, greetings and sign-off included. Names,
+employers, email addresses and phone numbers are kept as given.
+
+- Any locale in the CLDR data that ships with Babel is accepted, so a new market
+  needs no code change. A malformed or unknown tag returns `400` before any
+  model call, rather than quietly producing English.
+- `lang` (and `dir="rtl"` for Arabic, Hebrew and other right-to-left
+  languages) is set on the returned `<html>` element. The response reports
+  `language` and `language_enforced`.
+- The cover letter's default date is written the local way (`7 novembre 2026`,
+  `7. November 2026`). An explicit `letter_date` is still used exactly as sent.
+- Regional variants get their conventions where they differ: `de-CH` uses
+  Swiss spelling (`ss`, never `ß`).
+- For `/analyze-cv`, the JSON keys stay in English and only the text values
+  are translated.
+- Leave `language` out (or send it blank) and nothing changes: the prompt and
+  response are exactly as before, with no `language` fields added.
+
 #### `POST /optimize-cv`
 Generate an optimized, ATS-friendly resume.
 
@@ -68,6 +91,7 @@ Generate an optimized, ATS-friendly resume.
 - `style` (default: `classic`): `classic`, `modern` (alias `minimal`) or `creative`
 - `full_name`, `email`, `phone`, `address`, `city_state_zip` (optional): Applicant contact details
 - `user_query` (optional): Free-text preference passed on to the model
+- `language` (optional): Output language as a BCP 47 tag, e.g. `fr`, `de-CH`, `ar` (see [Output language](#output-language))
 
 ##### How contact details stay the applicant's own
 
@@ -102,6 +126,8 @@ Generate a professional cover letter.
 - `timezone` (optional): IANA name (`Pacific/Auckland`) or UTC offset (`+13:00`,
   `-0800`, `UTC+13`) the default date is computed in. May also be sent as an
   `X-Timezone` header, which is usually one line in a shared HTTP client.
+- `language` (optional): Output language as a BCP 47 tag; also sets how the
+  default date is written (see [Output language](#output-language))
 
 ##### How the date gets its timezone
 
@@ -164,6 +190,7 @@ Analyze CV against job description.
 **Parameters:**
 - `generate_pdf` (default: false): Return PDF instead of JSON
 - `model` (optional): AI model to use
+- `language` (optional): Language for the analysis text; keys stay English
 
 ### Information Endpoints
 

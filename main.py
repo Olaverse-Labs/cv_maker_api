@@ -10,10 +10,11 @@ import tempfile
 import os
 from utils import (convert_html_to_pdf, extract_document_text, DocumentError,
                    parse_model_json, enforce_letter_date, enforce_contact_details,
-                   today_in_timezone, infer_timezone)
+                   today_in_timezone, infer_timezone, enforce_document_language)
 from templates import get_style_template, get_style_reference, get_style_class_names
 from openrouter import chat_completion, chat_completion_with_reason, OpenRouterError
 from prompts import build_analysis_prompt, wrap_user_instructions
+from languages import resolve_language, LanguageError
 import json as pyjson
 
 logging.basicConfig(
@@ -79,6 +80,18 @@ def _pdf_response(pdf_content: bytes, filename: str) -> FileResponse:
     )
 
 
+def _apply_language(html_content, language, model_id, document):
+    """Pin lang/dir on the generated document. Returns (html, applied)."""
+    if not language:
+        return html_content, False
+    html_content, applied = enforce_document_language(
+        html_content, language.tag, language.rtl)
+    if not applied:
+        logger.warning("%s has no <html> tag to set lang=%s on model=%s",
+                       document, language.tag, model_id)
+    return html_content, applied
+
+
 @app.post('/optimize-cv')
 def optimize_cv(
     cv_file: Optional[UploadFile] = File(None),
@@ -94,8 +107,17 @@ def optimize_cv(
     generate_pdf: bool = Form(False),
     model: str = Form(None),
     style: str = Form("classic"),
-    user_query: str = Form(None) # New optional parameter
+    user_query: str = Form(None), # New optional parameter
+    # BCP 47 tag for the output language ("fr", "de-CH", "ar"). Omitted, the
+    # prompt says nothing about language, as before.
+    language: Optional[str] = Form(None)
 ):
+    # Checked before the documents are read so a bad tag costs no model call
+    try:
+        output_language = resolve_language(language)
+    except LanguageError as e:
+        return JSONResponse({'error': e.message}, status_code=400)
+
     # Read the CV and job description from either an upload or raw text
     try:
         cv_extracted_text = extract_document_text(cv_file, cv_text, 'CV')
@@ -112,7 +134,8 @@ def optimize_cv(
     style_classes = ', '.join(get_style_class_names(style))
 
     # 1. Run analysis
-    analysis_prompt = build_analysis_prompt(cv_extracted_text, job_desc_extracted_text)
+    analysis_prompt = build_analysis_prompt(
+        cv_extracted_text, job_desc_extracted_text, output_language)
     try:
         analysis_content = chat_completion(
             selected_model, analysis_prompt, temperature=0.3,
@@ -168,7 +191,7 @@ CV Analysis (for context):
 ### ATS Compatibility Rules
 - Every piece of information must be real selectable text. Never place content in an image.
 - Do not use <table> elements to lay out content, and do not add graphics or icons that carry meaning.
-- Use standard section headers that ATS systems recognise (Experience, Education, Skills)
+- Use standard section headers that ATS systems recognise (Experience, Education, Skills{', or their conventional equivalents in the output language' if output_language else ''})
 - Use consistent bullet points and spacing
 - Include relevant keywords naturally within content
 - Ensure proper hierarchy with clear headings
@@ -211,6 +234,9 @@ Generate the CV as a complete HTML document with:
 - Return the raw HTML document only. Do not wrap it in a markdown code fence and do not add commentary before or after it.
 """
     
+    if output_language:
+        prompt += output_language.prompt_instructions('CV')
+
     # Caller free-text, fenced so it reads as preference rather than instruction
     prompt += wrap_user_instructions(user_query)
 
@@ -240,6 +266,9 @@ Generate the CV as a complete HTML document with:
 
         # A reply that ran out of tokens is a CV cut off mid-tag. It used to be
         # returned as a success and rendered into a PDF that looked finished.
+        html_content, language_applied = _apply_language(
+            html_content, output_language, selected_model, 'CV')
+
         truncated = finish_reason == 'length'
         if truncated:
             logger.warning("CV generation truncated at max_tokens model=%s", selected_model)
@@ -252,6 +281,11 @@ Generate the CV as a complete HTML document with:
             'contact_enforced': contact_report,
             'truncated': truncated
         }
+
+        # Only when asked for, so a response without `language` is unchanged
+        if output_language:
+            response_data['language'] = output_language.tag
+            response_data['language_enforced'] = language_applied
 
         # Generate PDF if requested
         if generate_pdf and truncated:
@@ -334,8 +368,14 @@ def generate_cover_letter(
     # the wording, or a `timezone` to keep the default correct for the applicant.
     letter_date: Optional[str] = Form(None),
     timezone: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
     request: Request = None
 ):
+    try:
+        output_language = resolve_language(language)
+    except LanguageError as e:
+        return JSONResponse({'error': e.message}, status_code=400)
+
     # Read the CV and job description from either an upload or raw text
     try:
         cv_extracted_text = extract_document_text(cv_file, cv_text, 'CV')
@@ -372,7 +412,11 @@ def generate_cover_letter(
         # Falling back silently would reproduce the very bug this guards against.
         logger.warning("unresolvable timezone %r; inferred %s instead",
                        timezone[:64], zone or DEFAULT_TIMEZONE)
-    current_date = supplied_date or today_in_timezone(zone, DEFAULT_TIMEZONE)
+    # A French letter dated "November 7, 2026" reads as a template, so the
+    # default date is spelled the way the output language spells it.
+    current_date = supplied_date or today_in_timezone(
+        zone, DEFAULT_TIMEZONE,
+        formatter=output_language.format_date if output_language else None)
     zone_used = None if supplied_date else (zone or DEFAULT_TIMEZONE)
 
     # Compose the new ATS-friendly cover letter prompt
@@ -776,6 +820,8 @@ CV Content:
 - The entire cover letter must fit on a single A4 page. Trim or summarize content as needed to ensure it does not overflow to a second page.
 - The header date must read exactly `{current_date}`, and that date must appear nowhere else in the letter.
 """
+    if output_language:
+        prompt += output_language.prompt_instructions('cover letter')
     
     try:
         html_content, finish_reason = chat_completion_with_reason(
@@ -809,6 +855,9 @@ CV Content:
                     "%s supplied but the letter has no class=\"contact-info\" "
                     "element to pin it in model=%s", field, selected_model)
 
+        html_content, language_applied = _apply_language(
+            html_content, output_language, selected_model, 'cover letter')
+
         truncated = finish_reason == 'length'
         if truncated:
             logger.warning("cover letter truncated at max_tokens model=%s", selected_model)
@@ -832,6 +881,10 @@ CV Content:
             }
         }
         
+        if output_language:
+            response_data['language'] = output_language.tag
+            response_data['language_enforced'] = language_applied
+
         if generate_pdf and truncated:
             response_data['pdf_error'] = (
                 'The model ran out of output tokens and the letter is incomplete, '
@@ -859,8 +912,14 @@ def analyze_cv(
     cv_text: Optional[str] = Form(None),
     job_desc_file: Optional[UploadFile] = File(None),
     job_desc_text: Optional[str] = Form(None),
-    model: str = Form(None)
+    model: str = Form(None),
+    language: Optional[str] = Form(None)
 ):
+    try:
+        output_language = resolve_language(language)
+    except LanguageError as e:
+        return JSONResponse({'error': e.message}, status_code=400)
+
     # Read the CV and job description from either an upload or raw text
     try:
         cv_extracted_text = extract_document_text(cv_file, cv_text, 'CV')
@@ -873,7 +932,8 @@ def analyze_cv(
     selected_model = resolve_model(model)
     
     # Create prompt for comprehensive CV analysis with JSON output
-    prompt = build_analysis_prompt(cv_extracted_text, job_desc_extracted_text)
+    prompt = build_analysis_prompt(
+        cv_extracted_text, job_desc_extracted_text, output_language)
     
     try:
         analysis_content = chat_completion(
@@ -891,11 +951,14 @@ def analyze_cv(
                 status_code=502
             )
 
-        return JSONResponse({
+        response_data = {
             'message': 'CV analysis completed successfully',
             'analysis': analysis_json,
             'model_used': selected_model
-        })
+        }
+        if output_language:
+            response_data['language'] = output_language.tag
+        return JSONResponse(response_data)
         
     except OpenRouterError as e:
         return JSONResponse({'error': f'API request failed: {str(e)}'}, status_code=500)

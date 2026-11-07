@@ -353,16 +353,46 @@ def infer_timezone(headers=None, explicit=None):
     return None, 'default'
 
 
-def today_in_timezone(name, fallback=None):
+def today_in_timezone(name, fallback=None, formatter=None):
     """Today's date where the applicant is, formatted for a letter head.
 
     `name` wins, `fallback` (the configured default) is tried next, and UTC is
-    the last resort. The day is composed rather than strftime'd because the
-    padding-free directive for it differs between platforms.
+    the last resort. `formatter` turns the date into text, for a letter in
+    another language; without one it is US English. The day is composed rather
+    than strftime'd because the padding-free directive for it differs between
+    platforms.
     """
     tz = resolve_timezone(name) or resolve_timezone(fallback) or timezone.utc
     today = datetime.now(tz)
+    if formatter:
+        return formatter(today.date())
     return f"{today:%B} {today.day}, {today:%Y}"
+
+
+_HTML_OPEN_RE = re.compile(r'<html\b[^>]*>', re.IGNORECASE)
+_LANG_DIR_ATTR_RE = re.compile(
+    r'\s+(?:lang|dir)\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)', re.IGNORECASE)
+
+
+def enforce_document_language(html_content: str, tag: str, rtl: bool = False):
+    """Stamp `lang` (and `dir` for a right-to-left language) on the <html> tag.
+
+    The prompt asks for both, but a model that copied the English templates'
+    `lang="en"` would leave screen readers, hyphenation and the PDF renderer's
+    font choice working in the wrong language — and an Arabic CV without
+    dir="rtl" prints with its punctuation and bullets on the wrong side.
+
+    Returns (html, applied). False means there was no <html> tag to stamp.
+    """
+    if not html_content or not tag:
+        return html_content, False
+    match = _HTML_OPEN_RE.search(html_content)
+    if not match:
+        return html_content, False
+    opening = _LANG_DIR_ATTR_RE.sub('', match.group(0))
+    attrs = f' lang="{escape(tag)}" dir="{"rtl" if rtl else "ltr"}"'
+    opening = opening[:5] + attrs + opening[5:]
+    return html_content[:match.start()] + opening + html_content[match.end():], True
 
 
 # An element carrying a class attribute, plus its contents up to its own closing

@@ -30,7 +30,7 @@ Rules:
 - Judge only what the CV actually says. Do not assume unstated experience.
 - If the job description is empty or unrelated, score against general CV quality and say so in overall_assessment.
 - Keep every array within its cap. Prefer the most important items over completeness.
-
+{language_rules}
 Job Description:
 {job_description}
 
@@ -40,11 +40,16 @@ CV Content:
 Return ONLY the JSON object, with no explanation, commentary or markdown fence."""
 
 
-def build_analysis_prompt(cv_content, job_description):
-    """The single analysis prompt shared by /optimize-cv and /analyze-cv."""
+def build_analysis_prompt(cv_content, job_description, language=None):
+    """The single analysis prompt shared by /optimize-cv and /analyze-cv.
+
+    `language` is a languages.Language, or None to leave the reply's language
+    to the model as before.
+    """
     return ANALYSIS_PROMPT.format(
         cv_content=cv_content or '',
-        job_description=job_description or ''
+        job_description=job_description or '',
+        language_rules=language.analysis_instructions() if language else ''
     )
 
 
