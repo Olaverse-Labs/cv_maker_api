@@ -953,6 +953,29 @@ def test_pdf_conversion_times_out_rather_than_hanging(monkeypatch):
     assert seen['data']['marginTop'] == '0.4in'
 
 
+# Fields POST /forms/chromium/convert/html accepts in both Gotenberg 8 and 9.
+# Gotenberg 9 answers 400 to any field outside its list.
+_GOTENBERG_HTML_FIELDS = {
+    'paperWidth', 'paperHeight', 'marginTop', 'marginBottom', 'marginLeft',
+    'marginRight', 'preferCssPageSize', 'landscape', 'scale', 'printBackground',
+    'omitBackground', 'waitDelay', 'emulatedMediaType',
+}
+
+
+def test_pdf_request_sends_only_fields_gotenberg_knows(monkeypatch):
+    seen = {}
+
+    def fake_post(url, files=None, data=None, auth=None, timeout=None):
+        seen['data'] = data
+        return StubPdfResponse()
+
+    monkeypatch.setattr(utils.requests, 'post', fake_post)
+    utils.convert_html_to_pdf('<html><head></head><body>x</body></html>')
+    assert set(seen['data']) <= _GOTENBERG_HTML_FIELDS, \
+        set(seen['data']) - _GOTENBERG_HTML_FIELDS
+    assert (seen['data']['paperWidth'], seen['data']['paperHeight']) == ('210mm', '297mm')
+
+
 def test_pdf_margin_reaches_the_page_css(monkeypatch):
     seen = {}
 

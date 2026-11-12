@@ -686,7 +686,13 @@ def convert_html_to_pdf(html_content: str, filename: str = "document.pdf", pdf_m
                 'marginBottom': pdf_margin,
                 'marginLeft': pdf_margin,
                 'marginRight': pdf_margin,
-                'format': 'A4',
+                # A4. These are the field names Gotenberg 8 and 9 both know.
+                # This used to send `format: 'A4'`, which Gotenberg never had:
+                # 8 ignored the unknown field, but 9 rejects the whole request
+                # with "form field 'format' is unknown to this route". Only
+                # send fields from Gotenberg's documented list.
+                'paperWidth': '210mm',
+                'paperHeight': '297mm',
                 'preferCssPageSize': 'true'
             }
             # Without a timeout a hung Gotenberg holds this worker thread for the
